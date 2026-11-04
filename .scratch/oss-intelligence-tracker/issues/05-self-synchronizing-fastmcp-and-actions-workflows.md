@@ -1,0 +1,14 @@
+# 05: Windows-Safe Self-Synchronizing Local FastMCP Server and GitHub Actions Dual-Track Workflows
+
+**What to build:** End-to-end cloud-to-local synchronization and agent query interface: scheduled GitHub Actions workflows with explicit `permissions: contents: write` and `concurrency: db-pipeline` lock that commit deterministic plain-text SQL exports and publish binary `intelligence.db` to the rolling `latest-db` GitHub Release tag, paired with a local `FastMCP` server that lazily synchronizes `intelligence.db` via 1-hour TTL + HTTP `ETag` atomic swap (explicitly closing all SQLite read connections before replacement to prevent Windows `WinError 32` crashes, plus three-tier offline fallback) and exposes structured intelligence query tools.
+
+**Blocked by:** 03: Orthogonal Lifecycle State Machine with Cold-Start Baselines and Full-Table COOLED Decay, 04: Throttled Apprise Batch Digest with 72-Hour Cooldown Window
+
+**Status:** ready-for-agent
+
+- [ ] High-frequency (every 6 hours) and mid-frequency (daily) GitHub Actions workflows explicitly declare `permissions: contents: write`, share `concurrency: { group: db-pipeline, cancel-in-progress: false }`, execute `git pull --rebase` before committing deterministic `ghr_id ASC` ordered SQL dumps, and overwrite the compiled binary `intelligence.db` asset on the rolling `latest-db` GitHub Release tag.
+- [ ] Invoking any `FastMCP` query tool checks local database freshness against `MCP_SYNC_TTL_SECONDS` (default 3600s); within TTL, queries execute immediately against the local SQLite file with zero network requests.
+- [ ] When TTL expires, `FastMCP` requests the `latest-db` Release asset with `If-None-Match: <ETag>` (attaching `Authorization: Bearer <GITHUB_TOKEN>` when configured for Private repos, or unauthenticated for Public repos): on `304 Not Modified` it refreshes the TTL timestamp without downloading; on `200 OK` it streams to `intelligence.db.tmp` and validates the SQLite header.
+- [ ] Before calling `os.replace('intelligence.db.tmp', 'intelligence.db')`, the sync manager acquires an exclusive lock and **explicitly closes all open SQLite connections** so Windows releases all file handles on `intelligence.db` (preventing `PermissionError: [WinError 32]`), re-opening connections only after the swap succeeds.
+- [ ] When offline or when the Release request fails, `FastMCP` falls back first to the existing local `intelligence.db` (attaching a `staleness_warning` metadata field to the tool response), and if no local `.db` exists, automatically compiles `intelligence.db` from the local plain-text SQL dump.
+- [ ] `FastMCP` exposes tools to query surging repositories, filter by language/state/curation/keyword, inspect a repository's longitudinal **Snapshot** trajectory, and force an immediate sync, all verified by Seam 2 integration tests (including a test that opens and queries `intelligence.db` prior to triggering a `200 OK` hot swap on Windows).
