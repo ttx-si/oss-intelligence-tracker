@@ -10,10 +10,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Protocol
 
+from oss_intelligence.lifecycle import LifecycleStateMachine
 from oss_intelligence.models import (
     RawSignalCandidate,
     RepositoryMetadata,
     RepositoryRecord,
+    is_trending_signal_source,
 )
 from oss_intelligence.store import IntelligenceStore
 
@@ -88,7 +90,11 @@ def _merge_candidate_into_repository(
         is_curated=merged_is_curated,
         curated_issue=merged_curated_issue,
         curated_category=merged_curated_category,
-        last_seen_in_trending_at=timestamp,
+        last_seen_in_trending_at=(
+            timestamp
+            if is_trending_signal_source(candidate.signal_source)
+            else existing.last_seen_in_trending_at
+        ),
         last_updated_at=timestamp,
     )
     snapshot_stars = candidate.stars if candidate.stars > 0 else merged_stars
@@ -228,3 +234,5 @@ class IngestionPipeline:
                     source_rank=candidate.source_rank,
                     period_stars_reported=candidate.period_stars_reported,
                 )
+
+        LifecycleStateMachine(self._store).evaluate(now=timestamp)

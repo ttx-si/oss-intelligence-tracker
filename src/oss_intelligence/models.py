@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+CURATION_SIGNAL_SOURCES: frozenset[str] = frozenset({"hellogithub"})
+
+
+def is_trending_signal_source(signal_source: str) -> bool:
+    """Returns True when signal_source represents a momentum/trending signal rather than editorial Curation."""
+    return signal_source not in CURATION_SIGNAL_SOURCES
+
 
 @dataclass(frozen=True, slots=True)
 class RawSignalCandidate:

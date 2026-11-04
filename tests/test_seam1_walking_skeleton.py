@@ -88,7 +88,7 @@ def test_ingests_gtrending_candidates_and_creates_repositories_and_snapshots(
     assert repo.license_spdx == "MIT"
     assert repo.topics == ("python", "packaging", "rust")
     assert repo.stars_total == 28500
-    assert repo.lifecycle_state == "DISCOVERY"
+    assert repo.lifecycle_state == "SURGING"
 
     snapshots = store.list_snapshots(ghr_id=754891001)
     assert len(snapshots) == 1
