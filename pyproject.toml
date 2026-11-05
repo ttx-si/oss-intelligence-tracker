@@ -8,10 +8,11 @@ version = "0.1.0"
 description = "Serverless Open Source Intelligence Tracker"
 readme = "GLOSSARY.md"
 requires-python = ">=3.11"
-dependencies = ["apprise>=1.7", "gtrending>=0.5.1"]
+dependencies = ["apprise>=1.7", "gtrending>=0.5.1", "fastmcp>=2.14,<3"]
 
 [project.scripts]
 oss-intelligence = "oss_intelligence.cli:main"
+oss-intelligence-mcp = "oss_intelligence.mcp_server:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

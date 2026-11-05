@@ -158,6 +158,16 @@ Every pipeline execution evaluates the state machine in two phases:
     - **Fallback Tier 1**: If a valid local `intelligence.db` already exists, use it and attach a `staleness_warning` metadata field to the MCP tool output.
     - **Fallback Tier 2**: If no local `intelligence.db` exists, locate the tracked plain-text SQL dump in the workspace and execute `sqlite3.Connection.executescript()` to materialize `intelligence.db` locally.
 
+#### Running the local service
+
+Install the project with `python -m pip install .`, then start `oss-intelligence-mcp` from the checkout directory. The equivalent module command is `python -m oss_intelligence.mcp_server`. The server uses MCP over standard input/output; its five tools return structured results with a `metadata` object. `search_repositories` accepts `language`, `state`, `curated`, `keyword`, `min_stars_delta_24h`, and `limit`; `get_repo_trajectory` accepts an integer `ghr_id`.
+
+By default, the Release URL is derived from `GITHUB_REPOSITORY=owner/repository` or the checkout's GitHub `origin`. Set `GITHUB_RELEASE_DB_URL` or pass `--release-url` to choose another asset URL. With `GITHUB_TOKEN` and the standard GitHub rolling Release URL, the service resolves the current asset through the GitHub Release API, then downloads it using the token. The token needs permission to read the private repository; redirects to a different origin do not receive it. No token is required for a public Release.
+
+`--database` and `--dump` select the local SQLite file and SQL dump; their defaults are `intelligence.db` and `data/schema_data.sql` relative to the working directory. `MCP_DATABASE` and `MCP_SQL_DUMP` set the same defaults. `MCP_SYNC_TTL_SECONDS` changes the default 3600-second freshness window, while `sync_database_now` bypasses it. Sync metadata and an advisory lock are stored next to the local database. Cooperative server processes hold the lock across each read or swap, and each SQLite connection is explicitly closed before releasing the lock. Other programs that independently hold the database open cannot be closed by this service.
+
+The workflows restore the checked-in SQL dump, ingest signals, export the deterministic dump, commit any change, and upload the compiled database. Configure the Actions secret `APPRISE_URLS` to send notifications; without it the workflows use the existing dry-run mode. An optional `TRENDSHIFT_API_KEY` secret enables that Signal Source. The workflows do not need a personal token: they use the built-in GitHub Actions token with `contents: write`.
+
 ---
 
 ## Testing Decisions

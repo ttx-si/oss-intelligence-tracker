@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 *.db
 *.db.tmp
+*.db.lock
+*.db.sync.json
+*.db.sync.json.tmp

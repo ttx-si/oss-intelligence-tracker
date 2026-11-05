@@ -1,0 +1,54 @@
+name: High-frequency intelligence
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: db-pipeline
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install project
+        run: python -m pip install .
+      - name: Rebase before ingestion
+        run: git pull --rebase origin "$GITHUB_REF_NAME"
+      - name: Restore, ingest, and export
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPRISE_URLS: ${{ secrets.APPRISE_URLS }}
+          TRENDSHIFT_API_KEY: ${{ secrets.TRENDSHIFT_API_KEY }}
+        run: |
+          python -c 'from pathlib import Path; from oss_intelligence.store import IntelligenceStore; s = IntelligenceStore("intelligence.db"); p = Path("data/schema_data.sql"); s.import_sql_dump(p) if p.exists() else None'
+          if [ -n "$APPRISE_URLS" ]; then
+            python -m oss_intelligence --database intelligence.db
+          else
+            python -m oss_intelligence --database intelligence.db --dry-run
+          fi
+          python -c 'from oss_intelligence.store import IntelligenceStore; IntelligenceStore("intelligence.db").export_sql_dump("data/schema_data.sql")'
+      - name: Commit SQL and publish database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/schema_data.sql
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update intelligence SQL dump'
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+          gh release view latest-db >/dev/null 2>&1 || gh release create latest-db --title 'Latest intelligence database' --notes 'Rolling SQLite database asset.'
+          gh release upload latest-db intelligence.db --clobber
