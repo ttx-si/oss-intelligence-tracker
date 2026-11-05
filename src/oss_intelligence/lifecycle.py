@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -11,19 +12,10 @@ from oss_intelligence.models import (
     is_trending_signal_source,
 )
 from oss_intelligence.store import IntelligenceStore
+from oss_intelligence.time_utils import parse_utc
 
 _SECONDS_PER_HOUR = 3600.0
 _SECONDS_PER_DAY = 86400.0
-
-
-def _parse_utc(timestamp: str) -> datetime:
-    text = timestamp.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +46,7 @@ def _consolidate_snapshots(
 ) -> list[_ConsolidatedObservation]:
     by_ts: dict[str, list[SnapshotRecord]] = {}
     for snap in snapshots:
-        snap_dt = _parse_utc(snap.captured_at)
+        snap_dt = parse_utc(snap.captured_at)
         if snap_dt <= now_dt:
             by_ts.setdefault(snap.captured_at, []).append(snap)
 
@@ -63,7 +55,7 @@ def _consolidate_snapshots(
         observations.append(
             _ConsolidatedObservation(
                 captured_at=ts,
-                captured_dt=_parse_utc(ts),
+                captured_dt=parse_utc(ts),
                 stars=max(s.stars for s in group),
                 period_stars_reported=max(s.period_stars_reported for s in group),
                 has_trending_source=any(is_trending_signal_source(s.signal_source) for s in group),
@@ -99,7 +91,7 @@ def _compute_velocities(
 ) -> tuple[int, int, int]:
     """Computes (stars_delta_6h, stars_delta_24h, stars_delta_7d) for a Repository at now_dt."""
     if not observations:
-        last_seen_dt = _parse_utc(repo.last_seen_in_trending_at)
+        last_seen_dt = parse_utc(repo.last_seen_in_trending_at)
         age_sec = (now_dt - last_seen_dt).total_seconds()
         delta_6h = repo.stars_delta_6h if age_sec <= 6 * _SECONDS_PER_HOUR else 0
         delta_24h = repo.stars_delta_24h if age_sec <= 24 * _SECONDS_PER_HOUR else 0
@@ -176,9 +168,11 @@ class LifecycleStateMachine:
     def __init__(self, store: IntelligenceStore) -> None:
         self._store = store
 
-    def evaluate(self, now: str | None = None) -> None:
+    def evaluate(
+        self, now: str | None = None, *, transition_clock: Callable[[], str] | None = None
+    ) -> None:
         timestamp = now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        now_dt = _parse_utc(timestamp)
+        now_dt = parse_utc(timestamp)
 
         repos = self._store.list_repositories()
         if not repos:
@@ -199,10 +193,10 @@ class LifecycleStateMachine:
             delta_6h, delta_24h, delta_7d = _compute_velocities(repo, observations, now_dt)
             latest_stars = max(repo.stars_total, observations[-1].stars if observations else 0)
             days_since_trending = (
-                now_dt - _parse_utc(repo.last_seen_in_trending_at)
+                now_dt - parse_utc(repo.last_seen_in_trending_at)
             ).total_seconds() / _SECONDS_PER_DAY
             days_tracked = (
-                now_dt - _parse_utc(repo.first_seen_at)
+                now_dt - parse_utc(repo.first_seen_at)
             ).total_seconds() / _SECONDS_PER_DAY
             is_cooling = days_since_trending >= 14.0 - 1e-9 and delta_24h < 20
 
@@ -226,7 +220,7 @@ class LifecycleStateMachine:
                 earliest_repo_dt = (
                     observations[0].captured_dt
                     if observations
-                    else _parse_utc(repo.first_seen_at)
+                    else parse_utc(repo.first_seen_at)
                 )
                 if lang not in lang_earliest_dt or earliest_repo_dt < lang_earliest_dt[lang]:
                     lang_earliest_dt[lang] = earliest_repo_dt
@@ -269,7 +263,7 @@ class LifecycleStateMachine:
             if next_state != "SURGING":
                 surging_entered_at = None
             elif repo.lifecycle_state != "SURGING":
-                surging_entered_at = timestamp
+                surging_entered_at = transition_clock() if transition_clock is not None else timestamp
             else:
                 surging_entered_at = repo.surging_entered_at or repo.last_notified_at or timestamp
 
@@ -281,6 +275,10 @@ class LifecycleStateMachine:
                 stars_delta_7d=ev.delta_7d,
                 lifecycle_state=next_state,
                 surging_entered_at=surging_entered_at,
-                last_updated_at=timestamp,
+                last_updated_at=(
+                    surging_entered_at
+                    if next_state == "SURGING" and repo.lifecycle_state != "SURGING"
+                    else timestamp
+                ),
             )
             self._store.save_repository(updated)

@@ -3,24 +3,23 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import timedelta
 from typing import Protocol
 
 from oss_intelligence.models import RepositoryRecord
 from oss_intelligence.store import IntelligenceStore
+from oss_intelligence.time_utils import parse_utc
 
 logger = logging.getLogger(__name__)
 
 
+class AppriseResultProtocol(Protocol):
+    def __bool__(self) -> bool: ...
+
+
 class AppriseProtocol(Protocol):
-    def notify(self, *, title: str, body: str, body_format: str) -> bool: ...
-
-
-def _parse_utc(timestamp: str) -> datetime:
-    value = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+    def notify(self, *, title: str, body: str, body_format: str) -> AppriseResultProtocol: ...
 
 
 def _surging_qualifies(repo: RepositoryRecord) -> bool:
@@ -28,7 +27,7 @@ def _surging_qualifies(repo: RepositoryRecord) -> bool:
         return False
     if repo.last_notified_at is None:
         return True
-    return _parse_utc(repo.surging_entered_at) - _parse_utc(repo.last_notified_at) >= timedelta(hours=72)
+    return parse_utc(repo.surging_entered_at) - parse_utc(repo.last_notified_at) >= timedelta(hours=72)
 
 
 def _digest_entry(repo: RepositoryRecord, *, include_curation: bool = False) -> str:
@@ -44,7 +43,12 @@ def _digest_entry(repo: RepositoryRecord, *, include_curation: bool = False) -> 
 
 
 def deliver_batch_digest(
-    store: IntelligenceStore, notifier: AppriseProtocol | None, timestamp: str, *, dry_run: bool = False
+    store: IntelligenceStore,
+    notifier: AppriseProtocol | None,
+    timestamp: str,
+    *,
+    dry_run: bool = False,
+    delivery_clock: Callable[[], str] | None = None,
 ) -> str | None:
     repositories = store.list_repositories()
     surging = [
@@ -81,9 +85,11 @@ def deliver_batch_digest(
     except Exception as exc:
         logger.warning("Batch Digest delivery failed: error_type=%s", type(exc).__name__)
         return None
-    if delivered is True:
+    if delivered:
         store.mark_digest_notified(
-            [repo.ghr_id for repo in surging], [repo.ghr_id for repo in curated], timestamp
+            [repo.ghr_id for repo in surging],
+            [repo.ghr_id for repo in curated],
+            delivery_clock() if delivery_clock is not None else timestamp,
         )
     else:
         logger.warning("Batch Digest delivery was not confirmed")

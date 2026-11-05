@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+import tomllib
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from packaging.requirements import Requirement
 
-from oss_intelligence.models import RawSignalCandidate, RepositoryMetadata
+from oss_intelligence.models import RawSignalCandidate, RepositoryMetadata, RepositoryRecord
 from oss_intelligence.pipeline import IngestionPipeline
 from oss_intelligence.store import IntelligenceStore
 
@@ -67,6 +72,402 @@ class ConfiguredSpyApprise(SpyApprise):
     def add(self, url: str) -> bool:
         self.urls.append(url)
         return True
+
+
+def test_slow_run_measures_transition_and_delivery_at_the_actual_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=1,
+            full_name="org/slow",
+            description=None,
+            primary_language="Python",
+            license_spdx=None,
+            topics=(),
+            repo_created_at=None,
+            stars_total=1000,
+            forks_total=0,
+            stars_delta_6h=0,
+            stars_delta_24h=0,
+            stars_delta_7d=0,
+            lifecycle_state="SUSTAINED",
+            is_curated=False,
+            curated_issue=None,
+            curated_category=None,
+            first_seen_at="2026-10-28T03:00:00Z",
+            last_seen_in_trending_at="2026-11-03T03:00:00Z",
+            last_updated_at="2026-11-03T03:00:00Z",
+            last_notified_at="2026-11-01T03:00:00Z",
+            last_notified_state="SURGING",
+        )
+    )
+    current_time = datetime(2026, 11, 4, 2, 59, tzinfo=timezone.utc)
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time
+
+    class SlowSource(FakeSignalSource):
+        def fetch_candidates(self) -> list[RawSignalCandidate]:
+            nonlocal current_time
+            current_time += timedelta(minutes=2)
+            return super().fetch_candidates()
+
+    class SlowApprise(SpyApprise):
+        def notify(self, *, title: str, body: str, body_format: str) -> bool:
+            nonlocal current_time
+            current_time += timedelta(minutes=3)
+            return super().notify(title=title, body=body, body_format=body_format)
+
+    monkeypatch.setattr("oss_intelligence.pipeline.datetime", ControlledDateTime)
+    apprise = SlowApprise()
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            SlowSource(
+                [RawSignalCandidate(
+                    "org/slow", "gtrending", 1000, period_stars_reported=200, is_curated=True
+                )]
+            )
+        ],
+        metadata_client=FakeGitHubMetadataClient({}),
+        notifier=apprise,
+    ).run()
+
+    # The run starts a minute before the old cooldown expires, but the actual
+    # SURGING entry occurs one minute after it, so the breakout must be sent.
+    assert len(apprise.messages) == 1
+    assert "org/slow" in apprise.messages[0]["body"]
+    assert "Surging Breakouts" in apprise.messages[0]["body"]
+    repository = store.get_repository_by_ghr_id(1)
+    assert repository.surging_entered_at == "2026-11-04T03:01:00Z"
+    assert repository.last_notified_at == "2026-11-04T03:04:00Z"
+    assert repository.last_curated_notified_at == "2026-11-04T03:04:00Z"
+
+
+def test_slow_delivery_starts_cooldown_when_the_notification_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current_time = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    fetch_delay = timedelta(hours=1)
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time
+
+    class SlowSource(FakeSignalSource):
+        def fetch_candidates(self) -> list[RawSignalCandidate]:
+            nonlocal current_time
+            current_time += fetch_delay
+            return super().fetch_candidates()
+
+    class SlowApprise(SpyApprise):
+        def notify(self, *, title: str, body: str, body_format: str) -> bool:
+            nonlocal current_time
+            current_time += timedelta(hours=1)
+            return super().notify(title=title, body=body, body_format=body_format)
+
+    monkeypatch.setattr("oss_intelligence.pipeline.datetime", ControlledDateTime)
+    source = SlowSource(
+        [RawSignalCandidate("org/slow-delivery", "gtrending", 1000, period_stars_reported=200)]
+    )
+    apprise = SlowApprise()
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[source],
+        metadata_client=FakeGitHubMetadataClient({"org/slow-delivery": 1}),
+        notifier=apprise,
+    )
+
+    pipeline.run()  # Fetch completes at 01:00, delivery succeeds at 02:00.
+    fetch_delay = timedelta()
+
+    def run(at: str, period_stars: int) -> None:
+        source.candidates = [
+            RawSignalCandidate(
+                "org/slow-delivery", "gtrending", 1000, period_stars_reported=period_stars
+            )
+        ]
+        pipeline.run(captured_at=at)
+
+    run("2026-11-03T20:00:00Z", 20)
+    run("2026-11-04T01:30:00Z", 200)
+    assert len(apprise.messages) == 1  # Only 71.5 hours since delivery.
+
+    run("2026-11-04T01:45:00Z", 20)
+    run("2026-11-04T02:00:00Z", 200)
+    assert len(apprise.messages) == 2  # A fresh entry at 72 hours qualifies.
+    assert store.get_repository_by_ghr_id(1).last_notified_at == "2026-11-04T02:00:00Z"
+
+
+def test_slow_lifecycle_evaluation_records_the_actual_surging_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current_time = datetime(2026, 11, 4, 2, 59, tzinfo=timezone.utc)
+
+    class ControlledDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time
+
+    class SlowStore(IntelligenceStore):
+        def list_snapshots(self, ghr_id=None):
+            nonlocal current_time
+            snapshots = super().list_snapshots(ghr_id)
+            current_time += timedelta(minutes=2)
+            return snapshots
+
+    monkeypatch.setattr("oss_intelligence.pipeline.datetime", ControlledDateTime)
+    store = SlowStore(tmp_path / "intelligence.db")
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=1,
+            full_name="org/slow-evaluation",
+            description=None,
+            primary_language="Python",
+            license_spdx=None,
+            topics=(),
+            repo_created_at=None,
+            stars_total=1000,
+            forks_total=0,
+            stars_delta_6h=0,
+            stars_delta_24h=200,
+            stars_delta_7d=0,
+            lifecycle_state="SUSTAINED",
+            is_curated=False,
+            curated_issue=None,
+            curated_category=None,
+            first_seen_at="2026-10-28T03:00:00Z",
+            last_seen_in_trending_at="2026-11-04T02:00:00Z",
+            last_updated_at="2026-11-04T02:00:00Z",
+            last_notified_at="2026-11-01T03:00:00Z",
+            last_notified_state="SURGING",
+        )
+    )
+    notifier = SpyApprise()
+
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[],
+        metadata_client=FakeGitHubMetadataClient({}),
+        notifier=notifier,
+    ).run()
+
+    assert len(notifier.messages) == 1
+    assert "org/slow-evaluation" in notifier.messages[0]["body"]
+    assert store.get_repository_by_ghr_id(1).surging_entered_at == "2026-11-04T03:01:00Z"
+
+
+def test_spaced_utc_watermarks_allow_an_eligible_surging_entry(tmp_path: Path) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=1,
+            full_name="org/spaced",
+            description=None,
+            primary_language="Python",
+            license_spdx=None,
+            topics=(),
+            repo_created_at=None,
+            stars_total=1000,
+            forks_total=0,
+            stars_delta_6h=0,
+            stars_delta_24h=200,
+            stars_delta_7d=0,
+            lifecycle_state="SURGING",
+            is_curated=False,
+            curated_issue=None,
+            curated_category=None,
+            first_seen_at="2026-10-28T00:00:00Z",
+            last_seen_in_trending_at="2026-11-04T00:00:00Z",
+            last_updated_at="2026-11-04T00:00:00Z",
+            last_notified_at=" 2026-11-01T08:00:00+08:00 ",
+            last_notified_state="SURGING",
+            surging_entered_at=" 2026-11-04T00:00:00Z ",
+        )
+    )
+    apprise = SpyApprise()
+
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[],
+        metadata_client=FakeGitHubMetadataClient({}),
+        notifier=apprise,
+    ).run(captured_at="2026-11-04T00:00:00Z")
+
+    assert len(apprise.messages) == 1
+    assert "org/spaced" in apprise.messages[0]["body"]
+    assert store.get_repository_by_ghr_id(1).last_notified_at == "2026-11-04T00:00:00Z"
+
+
+def test_default_cli_path_declares_and_uses_gtrending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from oss_intelligence.cli import main
+
+    monkeypatch.setitem(
+        sys.modules,
+        "gtrending",
+        SimpleNamespace(
+            fetch_repos=lambda: [
+                {"fullname": "org/default-source", "stars": 1000, "currentPeriodStars": 200}
+            ]
+        ),
+    )
+    monkeypatch.delenv("TRENDSHIFT_API_KEY", raising=False)
+
+    def fake_urlopen(request, timeout):
+        url = request.full_url
+        if "/search/repositories?" in url:
+            body = {"items": []}
+        elif "api.ossinsight.io" in url:
+            body = {"data": {"rows": []}}
+        elif "raw.githubusercontent.com" in url:
+            return io.BytesIO(
+                b"# HelloGitHub issue 1\n## Python\n"
+                b"[org/default-source](https://github.com/org/default-source)\n"
+            )
+        elif "/repos/org/default-source" in url:
+            body = {"id": 1, "full_name": "org/default-source", "stargazers_count": 1000}
+        else:
+            raise AssertionError(f"Unexpected URL: {url}")
+        return io.BytesIO(json.dumps(body).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    db_path = tmp_path / "intelligence.db"
+
+    assert main(["--database", str(db_path), "--dry-run"]) == 0
+    assert "org/default-source" in capsys.readouterr().out
+    assert "gtrending" in {snap.signal_source for snap in IntelligenceStore(db_path).list_snapshots()}
+
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    dependencies = tomllib.loads(project_file.read_text(encoding="utf-8"))["project"]["dependencies"]
+    requirements = [Requirement(dependency) for dependency in dependencies]
+    assert any(
+        req.name.lower() == "gtrending" and req.marker is None and "0.5.1" in req.specifier
+        for req in requirements
+    ), "A clean project installation must install a compatible gtrending distribution"
+
+
+def test_real_gtrending_adapter_parses_an_offline_http_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("gtrending")
+    import requests
+
+    from oss_intelligence.adapters import GtrendingAdapter
+
+    html = """\
+<article>
+  <h2>org / real-library</h2>
+  <div></div><div></div>
+  <div>Python\n1,000\n12\n200 stars today</div>
+</article>
+"""
+    monkeypatch.setattr(requests, "get", lambda url: SimpleNamespace(text=html))
+
+    candidates = GtrendingAdapter().fetch_candidates()
+
+    assert len(candidates) == 1
+    assert candidates[0].full_name == "org/real-library"
+    assert candidates[0].signal_source == "gtrending"
+    assert candidates[0].stars == 1000
+    assert candidates[0].forks == 12
+    assert candidates[0].period_stars_reported == 200
+
+
+def test_successful_apprise_result_advances_watermarks(tmp_path: Path) -> None:
+    apprise_sdk = pytest.importorskip("apprise")
+
+    class InMemoryService(apprise_sdk.NotifyBase):
+        service_name = "In-memory test service"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.messages: list[str] = []
+
+        def send(self, body: str, title: str = "", **kwargs) -> bool:
+            self.messages.append(body)
+            return True
+
+    service = InMemoryService()
+    notifier = apprise_sdk.Apprise()
+    assert notifier.add(service)
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalSource(
+                [RawSignalCandidate(
+                    "org/apprise-result", "gtrending", 1000,
+                    period_stars_reported=200, is_curated=True,
+                )]
+            )
+        ],
+        metadata_client=FakeGitHubMetadataClient({"org/apprise-result": 1}),
+        notifier=notifier,
+    )
+
+    pipeline.run(captured_at="2026-11-01T00:00:00Z")
+
+    repository = store.get_repository_by_ghr_id(1)
+    assert repository.last_notified_at == "2026-11-01T00:00:00Z"
+    assert repository.last_curated_notified_at == "2026-11-01T00:00:00Z"
+    pipeline.run(captured_at="2026-11-01T06:00:00Z")
+    assert len(service.messages) == 1
+
+
+@pytest.mark.parametrize("outcomes", [(False,), (True, False)], ids=["failure", "partial"])
+def test_unsuccessful_real_apprise_result_does_not_advance_watermarks(
+    tmp_path: Path, outcomes: tuple[bool, ...]
+) -> None:
+    apprise_sdk = pytest.importorskip("apprise")
+
+    class InMemoryService(apprise_sdk.NotifyBase):
+        service_name = "In-memory test service"
+
+        def __init__(self, succeeds: bool) -> None:
+            super().__init__()
+            self.succeeds = succeeds
+
+        def send(self, body: str, title: str = "", **kwargs) -> bool:
+            return self.succeeds
+
+    notifier = apprise_sdk.Apprise()
+    services = [InMemoryService(succeeds) for succeeds in outcomes]
+    for service in services:
+        assert notifier.add(service)
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalSource(
+                [RawSignalCandidate(
+                    "org/apprise-failure", "gtrending", 1000,
+                    period_stars_reported=200, is_curated=True,
+                )]
+            )
+        ],
+        metadata_client=FakeGitHubMetadataClient({"org/apprise-failure": 1}),
+        notifier=notifier,
+    )
+
+    pipeline.run(captured_at="2026-11-01T00:00:00Z")
+    repository = store.get_repository_by_ghr_id(1)
+    assert repository.last_notified_at is None
+    assert repository.last_curated_notified_at is None
+
+    for service in services:
+        service.succeeds = True
+    pipeline.run(captured_at="2026-11-01T06:00:00Z")
+    repository = store.get_repository_by_ghr_id(1)
+    assert repository.last_notified_at == "2026-11-01T06:00:00Z"
+    assert repository.last_curated_notified_at == "2026-11-01T06:00:00Z"
 
 
 def test_first_surging_repository_is_delivered_and_watermarked(tmp_path: Path) -> None:

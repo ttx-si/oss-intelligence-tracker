@@ -23,6 +23,10 @@ from oss_intelligence.store import IntelligenceStore
 logger = logging.getLogger(__name__)
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 class SignalAdapterProtocol(Protocol):
     def fetch_candidates(self) -> list[RawSignalCandidate]: ...
 
@@ -156,6 +160,7 @@ class IngestionPipeline:
         return all_candidates
 
     def run(self, captured_at: str | None = None, *, dry_run: bool = False) -> str | None:
+        """Ingest and notify; an explicit captured_at fixes the clock for deterministic replay."""
         timestamp = captured_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         candidates = self._fetch_all_candidates_isolated()
         uncached_api_calls = 0
@@ -238,7 +243,17 @@ class IngestionPipeline:
                     period_stars_reported=candidate.period_stars_reported,
                 )
 
-        LifecycleStateMachine(self._store).evaluate(now=timestamp)
+        transition_timestamp = captured_at or _utc_now()
+        LifecycleStateMachine(self._store).evaluate(
+            now=transition_timestamp,
+            transition_clock=_utc_now if not captured_at else None,
+        )
         if self._notifier is not None or dry_run:
-            return deliver_batch_digest(self._store, self._notifier, timestamp, dry_run=dry_run)
+            return deliver_batch_digest(
+                self._store,
+                self._notifier,
+                transition_timestamp,
+                dry_run=dry_run,
+                delivery_clock=_utc_now if not captured_at else None,
+            )
         return None
