@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import io
 import asyncio
+import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import tomllib
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -224,14 +225,47 @@ def test_force_sync_hot_swaps_after_an_existing_query_on_windows(tmp_path: Path)
     assert service.get_surging_repos()["repositories"][0]["stars_total"] == 2222
 
 
+def test_fresh_cache_queries_continue_while_forced_sync_downloads(tmp_path: Path) -> None:
+    content = populated_database(tmp_path / "release.db")
+    entered = threading.Event()
+    resume = threading.Event()
+    requests = []
+
+    def endpoint(request, *, timeout):
+        requests.append(request)
+        if len(requests) == 2:
+            entered.set()
+            assert resume.wait(5)
+        return ReleaseResponse(content)
+
+    service = IntelligenceService(database=tmp_path / "intelligence.db",
+                                  release_url="https://example.invalid/db", opener=endpoint,
+                                  clock=lambda: 10000.0)
+    service.get_surging_repos()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        sync = executor.submit(service.sync_database_now)
+        assert entered.wait(5)
+        try:
+            cached = executor.submit(service.get_surging_repos)
+            assert cached.result(timeout=1)["repositories"][0]["full_name"] == "org/rocket"
+        finally:
+            resume.set()
+        assert sync.result(timeout=5)["status"] == "updated"
+
+
 def test_search_intersects_language_state_curation_keyword_and_velocity(tmp_path: Path) -> None:
     release = tmp_path / "release.db"
     populated_database(release)
     store = IntelligenceStore(release)
     original = store.get_repository_by_ghr_id(1)
-    store.save_repository(replace(original, ghr_id=2, full_name="org/quiet", is_curated=False,
-                                  stars_delta_24h=4))
-    store.save_repository(replace(original, ghr_id=3, full_name="org/other", primary_language="Go"))
+    for mismatch in (
+        replace(original, ghr_id=2, full_name="org/other-language", primary_language="Go"),
+        replace(original, ghr_id=3, full_name="org/other-state", lifecycle_state="SUSTAINED"),
+        replace(original, ghr_id=4, full_name="org/uncurated", is_curated=False),
+        replace(original, ghr_id=5, full_name="org/no-keyword", description="Fast tooling", topics=("cli",)),
+        replace(original, ghr_id=6, full_name="org/slow", stars_delta_24h=49),
+    ):
+        store.save_repository(mismatch)
     endpoint = ReleaseEndpoint(release.read_bytes())
     service = IntelligenceService(
         database=tmp_path / "intelligence.db", release_url="https://example.invalid/intelligence.db",
@@ -279,19 +313,6 @@ def test_real_fastmcp_protocol_exposes_structured_query_tools(tmp_path: Path) ->
             assert result.data["repositories"][0]["full_name"] == "org/rocket"
 
     asyncio.run(exercise())
-
-
-def test_mcp_server_has_installed_entry_point_and_command_line_help() -> None:
-    root = Path(__file__).resolve().parents[1]
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    assert any(dependency.startswith("fastmcp") for dependency in project["dependencies"])
-    assert project["scripts"]["oss-intelligence-mcp"] == "oss_intelligence.mcp_server:main"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(root / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    completed = subprocess.run([sys.executable, "-m", "oss_intelligence.mcp_server", "--help"],
-                               env=env, capture_output=True, text=True, timeout=10)
-    assert completed.returncode == 0
-    assert "--release-url" in completed.stdout and "--database" in completed.stdout
 
 
 def test_private_rolling_release_resolves_current_asset_through_github_api(
@@ -361,6 +382,90 @@ def test_corrupt_cache_is_not_revalidated_with_an_old_etag(tmp_path: Path) -> No
     assert requests[1].get_header("If-none-match") is None
 
 
+def test_sql_fallback_is_not_revalidated_as_the_previous_release_database(tmp_path: Path) -> None:
+    old_db = tmp_path / "old.db"
+    populated_database(old_db)
+    dump = IntelligenceStore(old_db).export_sql_dump(tmp_path / "schema_data.sql")
+    release = tmp_path / "release.db"
+    release.write_bytes(old_db.read_bytes())
+    with sqlite3.connect(release) as conn:
+        conn.execute("UPDATE repositories SET stars_total = 2222 WHERE ghr_id = 1")
+    requests = []
+    online = [True]
+
+    def endpoint(request, *, timeout):
+        requests.append(request)
+        if not online[0]:
+            raise TimeoutError("offline")
+        if request.get_header("If-none-match"):
+            raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
+        return ReleaseResponse(release.read_bytes(), etag='"latest"')
+
+    database = tmp_path / "intelligence.db"
+    service = IntelligenceService(database=database, dump_path=dump,
+                                  release_url="https://example.invalid/db", opener=endpoint)
+    assert service.get_surging_repos()["repositories"][0]["stars_total"] == 2222
+    database.unlink()
+    online[0] = False
+    assert service.get_surging_repos()["repositories"][0]["stars_total"] == 1000
+    online[0] = True
+
+    result = service.get_surging_repos()
+
+    assert requests[-1].get_header("If-none-match") is None
+    assert result["repositories"][0]["stars_total"] == 2222
+
+
+def test_replaced_database_with_unchanged_size_and_mtime_is_not_treated_as_fresh(tmp_path: Path) -> None:
+    release = tmp_path / "release.db"
+    old_content = populated_database(release)
+    with sqlite3.connect(release) as conn:
+        conn.execute("UPDATE repositories SET stars_total = 2222 WHERE ghr_id = 1")
+    endpoint = ReleaseEndpoint(release.read_bytes())
+    database = tmp_path / "intelligence.db"
+    service = IntelligenceService(database=database, release_url="https://example.invalid/db",
+                                  opener=endpoint, clock=lambda: 10000.0)
+    assert service.get_surging_repos()["repositories"][0]["stars_total"] == 2222
+    stat = database.stat()
+    assert len(old_content) == stat.st_size
+    database.write_bytes(old_content)
+    os.utime(database, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    result = service.get_surging_repos()
+
+    assert result["repositories"][0]["stars_total"] == 2222
+    assert len(endpoint.requests) == 2
+    assert endpoint.requests[-1][0].get_header("If-none-match") is None
+
+
+def test_database_changed_during_304_is_not_marked_as_the_release(tmp_path: Path) -> None:
+    release = tmp_path / "release.db"
+    fallback = populated_database(release)
+    with sqlite3.connect(release) as conn:
+        conn.execute("UPDATE repositories SET stars_total = 2222 WHERE ghr_id = 1")
+    latest = release.read_bytes()
+    database = tmp_path / "intelligence.db"
+    requests = []
+
+    def endpoint(request, *, timeout):
+        requests.append(request)
+        if len(requests) == 2:
+            database.write_bytes(fallback)
+            raise urllib.error.HTTPError(request.full_url, 304, "Not Modified", {}, None)
+        return ReleaseResponse(latest, etag='"latest"')
+
+    now = [10000.0]
+    service = IntelligenceService(database=database, release_url="https://example.invalid/db",
+                                  opener=endpoint, clock=lambda: now[0])
+    assert service.get_surging_repos()["repositories"][0]["stars_total"] == 2222
+    now[0] += 3600
+
+    interim = service.get_surging_repos()
+    assert "staleness_warning" in interim["metadata"]
+    assert service.get_surging_repos()["repositories"][0]["stars_total"] == 2222
+    assert requests[-1].get_header("If-none-match") is None
+
+
 def test_separate_server_processes_share_the_database_lock(tmp_path: Path) -> None:
     populated_database(tmp_path / "release.db")
     script = tmp_path / "client.py"
@@ -423,19 +528,46 @@ assert service.get_surging_repos()["repositories"][0]["full_name"] == "org/rocke
                 process.wait(timeout=5)
 
 
-def test_mcp_command_serves_a_real_stdio_session_offline_from_sql(tmp_path: Path) -> None:
+def test_installed_mcp_command_serves_a_real_stdio_session_offline_from_sql(tmp_path: Path) -> None:
     fastmcp = pytest.importorskip("fastmcp")
     from fastmcp.client.transports import StdioTransport
+
+    build_path = os.environ.get("MCP_TEST_BUILD_PATH")
+    if not build_path and importlib.util.find_spec("setuptools") is None:
+        pytest.skip("setuptools is required for an offline package installation")
+    root = Path(__file__).resolve().parents[1]
+    project = tmp_path / "project"
+    project.mkdir()
+    for filename in ("pyproject.toml", "GLOSSARY.md"):
+        shutil.copy(root / filename, project / filename)
+    shutil.copytree(root / "src", project / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    installed = tmp_path / "installed"
+    env = os.environ.copy()
+    env["PIP_CONFIG_FILE"] = os.devnull
+    env["PIP_NO_INDEX"] = "1"
+    install_env = env.copy()
+    if build_path:
+        install_env["PYTHONPATH"] = install_env.get("PYTHONPATH", "") + os.pathsep + build_path
+    install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation",
+         "--disable-pip-version-check", "--target", str(installed), str(project)],
+        env=install_env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+    command = installed / "bin" / ("oss-intelligence-mcp.exe" if os.name == "nt" else "oss-intelligence-mcp")
+    env["PYTHONPATH"] = str(installed) + os.pathsep + env.get("PYTHONPATH", "")
+    help_result = subprocess.run([str(command), "--help"], env=env, cwd=tmp_path,
+                                 capture_output=True, text=True, timeout=15)
+    assert help_result.returncode == 0
+    assert "--release-url" in help_result.stdout and "--database" in help_result.stdout
 
     source = tmp_path / "release.db"
     populated_database(source)
     dump = IntelligenceStore(source).export_sql_dump(tmp_path / "schema_data.sql")
-    env = os.environ.copy()
     for key in ("GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_RELEASE_DB_URL"):
         env.pop(key, None)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    transport = StdioTransport(command=sys.executable, args=["-m", "oss_intelligence.mcp_server",
-                               "--database", str(tmp_path / "intelligence.db"), "--dump", str(dump)],
+    transport = StdioTransport(command=str(command),
+                               args=["--database", str(tmp_path / "intelligence.db"), "--dump", str(dump)],
                                env=env, cwd=str(tmp_path), keep_alive=False)
 
     async def exercise():

@@ -6,6 +6,7 @@ import os
 import argparse
 import json
 import errno
+import hashlib
 import http.client
 import re
 import sqlite3
@@ -56,15 +57,22 @@ def _valid_database(path: Path) -> bool:
         return False
 
 
+def _database_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @contextmanager
-def _exclusive_database_lock(database: Path):
-    """Serialize cooperative readers and swaps in this process and other processes."""
-    key = os.path.normcase(str(database.resolve()))
+def _exclusive_lock(lock_path: Path):
+    """Acquire a cooperative thread and process lock."""
+    key = os.path.normcase(str(lock_path.resolve()))
     with _locks_guard:
         local_lock = _database_locks.setdefault(key, threading.RLock())
     with local_lock:
-        database.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = database.with_name(database.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+b") as lock_file:
             # Windows can lock a byte beyond EOF; no read/write is needed before locking.
             lock_file.seek(0)
@@ -93,6 +101,14 @@ def _exclusive_database_lock(database: Path):
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+def _exclusive_database_lock(database: Path):
+    return _exclusive_lock(database.with_name(database.name + ".lock"))
+
+
+def _exclusive_sync_lock(database: Path):
+    return _exclusive_lock(database.with_name(database.name + ".sync.lock"))
+
+
 class IntelligenceService:
     """Query tools with a release synchronization guard."""
 
@@ -116,27 +132,38 @@ class IntelligenceService:
         )
         self.metadata_path = self.database.with_name(self.database.name + ".sync.json")
 
-    def _sync(self, *, force: bool = False) -> str:
+    def _cached_metadata(self) -> tuple[dict, bool]:
         try:
             metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
-        last_check = metadata.get("last_check")
         try:
             stat = self.database.stat()
             same_database = (metadata.get("db_size") == stat.st_size
-                             and metadata.get("db_mtime_ns") == stat.st_mtime_ns)
+                             and metadata.get("db_mtime_ns") == stat.st_mtime_ns
+                             and metadata.get("db_sha256") == _database_digest(self.database))
         except OSError:
             same_database = False
-        if (not force and same_database and metadata.get("release_url") == self.release_url
-                and isinstance(last_check, (int, float))
-                and 0 <= self.clock() - last_check < self.ttl_seconds):
+        return metadata, same_database
+
+    def _is_fresh(self, metadata: dict, same_database: bool) -> bool:
+        last_check = metadata.get("last_check")
+        return bool(self.ttl_seconds > 0 and same_database
+                    and metadata.get("release_url") == self.release_url
+                    and isinstance(last_check, (int, float))
+                    and 0 <= self.clock() - last_check < self.ttl_seconds)
+
+    def _sync(self, *, force: bool = False) -> str:
+        with _exclusive_database_lock(self.database):
+            metadata, same_database = self._cached_metadata()
+            valid_local = _valid_database(self.database)
+        if not force and self._is_fresh(metadata, same_database):
             return "fresh"
-        valid_local = _valid_database(self.database)
         headers = {"Accept": "application/octet-stream", "User-Agent": "oss-intelligence-tracker"}
-        if valid_local and metadata.get("release_url") == self.release_url and isinstance(metadata.get("etag"), str):
+        if (valid_local and same_database and metadata.get("release_url") == self.release_url
+                and isinstance(metadata.get("etag"), str)):
             headers["If-None-Match"] = metadata["etag"]
         if token := os.environ.get("GITHUB_TOKEN"):
             headers["Authorization"] = f"Bearer {token}"
@@ -180,18 +207,27 @@ class IntelligenceService:
             error.close()
             if error.code != 304 or not valid_local or "If-None-Match" not in headers:
                 raise
-            self._save_metadata(metadata.get("etag"))
+            with _exclusive_database_lock(self.database):
+                current, still_same = self._cached_metadata()
+                if (not still_same or current.get("db_sha256") != metadata.get("db_sha256")
+                        or current.get("etag") != metadata.get("etag")
+                        or current.get("release_url") != self.release_url
+                        or not _valid_database(self.database)):
+                    raise OSError("Local database changed during Release revalidation")
+                self._save_metadata(metadata.get("etag"))
             return "not_modified"
         if not _valid_database(temporary):
             raise OSError("Release asset is not a valid intelligence database")
-        os.replace(temporary, self.database)
-        self._save_metadata(etag)
+        with _exclusive_database_lock(self.database):
+            os.replace(temporary, self.database)
+            self._save_metadata(etag)
         return "updated"
 
     def _save_metadata(self, etag: str | None) -> None:
         stat = self.database.stat()
         payload = {"last_check": self.clock(), "etag": etag, "release_url": self.release_url,
-                   "db_size": stat.st_size, "db_mtime_ns": stat.st_mtime_ns}
+                   "db_size": stat.st_size, "db_mtime_ns": stat.st_mtime_ns,
+                   "db_sha256": _database_digest(self.database)}
         temporary = self.metadata_path.with_name(self.metadata_path.name + ".tmp")
         try:
             temporary.write_text(json.dumps(payload), encoding="utf-8")
@@ -225,8 +261,8 @@ class IntelligenceService:
             conditions.append("instr(lower(full_name || ' ' || coalesce(description, '') || ' ' || topics_json), lower(?)) > 0")
             parameters.append(keyword)
         parameters.append(max(1, min(limit, 500)))
+        _, metadata = self._ready()
         with _exclusive_database_lock(self.database):
-            _, metadata = self._ready()
             conn = sqlite3.connect(self.database)
             conn.row_factory = sqlite3.Row
             try:
@@ -242,8 +278,8 @@ class IntelligenceService:
         return self.search_repositories(curated=True, limit=limit)
 
     def get_repo_trajectory(self, ghr_id: int) -> dict:
+        _, metadata = self._ready()
         with _exclusive_database_lock(self.database):
-            _, metadata = self._ready()
             conn = sqlite3.connect(self.database)
             conn.row_factory = sqlite3.Row
             try:
@@ -258,31 +294,41 @@ class IntelligenceService:
                 conn.close()
 
     def sync_database_now(self) -> dict:
-        with _exclusive_database_lock(self.database):
-            status, metadata = self._ready(force=True)
-            return {"status": status, "metadata": metadata}
+        status, metadata = self._ready(force=True)
+        return {"status": status, "metadata": metadata}
 
     def _ready(self, *, force: bool = False) -> tuple[str, dict]:
+        if not force:
+            with _exclusive_database_lock(self.database):
+                cached, same_database = self._cached_metadata()
+                if self._is_fresh(cached, same_database):
+                    return "fresh", {}
+        with _exclusive_sync_lock(self.database):
+            return self._sync_or_fallback(force=force)
+
+    def _sync_or_fallback(self, *, force: bool) -> tuple[str, dict]:
         metadata = {}
         try:
             status = self._sync(force=force)
         except (OSError, ValueError, http.client.HTTPException):
             self.database.with_name(self.database.name + ".tmp").unlink(missing_ok=True)
-            if not _valid_database(self.database):
-                sql = self.dump_path.read_text(encoding="utf-8")
-                self.database.parent.mkdir(parents=True, exist_ok=True)
-                temporary = self.database.with_name(self.database.name + ".tmp")
-                try:
-                    conn = sqlite3.connect(temporary)
+            with _exclusive_database_lock(self.database):
+                if not _valid_database(self.database):
+                    sql = self.dump_path.read_text(encoding="utf-8")
+                    self.database.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = self.database.with_name(self.database.name + ".tmp")
                     try:
-                        conn.executescript(sql)
+                        conn = sqlite3.connect(temporary)
+                        try:
+                            conn.executescript(sql)
+                        finally:
+                            conn.close()
+                        if not _valid_database(temporary):
+                            raise OSError("SQL dump did not produce a valid intelligence database")
+                        self.metadata_path.unlink(missing_ok=True)
+                        os.replace(temporary, self.database)
                     finally:
-                        conn.close()
-                    if not _valid_database(temporary):
-                        raise OSError("SQL dump did not produce a valid intelligence database")
-                    os.replace(temporary, self.database)
-                finally:
-                    temporary.unlink(missing_ok=True)
+                        temporary.unlink(missing_ok=True)
             metadata["staleness_warning"] = "Release sync failed; using the local database."
             status = "offline"
         return status, metadata

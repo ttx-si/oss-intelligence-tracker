@@ -52,3 +52,35 @@ python -m pytest -v --basetemp .pytest_cache\ticket05-final-20261105-b
 ```
 
 The complete run used elevated sandbox permissions because this Windows sandbox blocks the local asyncio socketpair and MinGit shell initialization; the suite's network, publishing and notification boundaries were simulated. Use a new, unique `--basetemp` path for another run. The live Actions environment and real GitHub Release remain untested by design.
+
+## Review repair and verification
+
+The review of commit `22ade0d1c018043dc7305d754c4fda46d9489537` identified five behavior defects and four test/design issues. All five were reproduced through the public query or workflow boundary. The Windows MinGit shell and real FastMCP local socket tests require the elevated sandbox; all Signal Sources, Git remotes, Release operations, and notifications in workflow tests are simulated. No real push, Release access, or notification is performed.
+
+| Repair slice | Observed red | Observed green |
+| --- | --- | --- |
+| ETag after offline SQL rebuild | Rebuilt SQL database sent the deleted Release database's `"latest"` ETag. | Rebuilt database invalidates metadata and fetches the asset without that ETag. Freshness and ETag now also require a SHA-256 match, including when size and mtime are unchanged. |
+| Forced sync versus fresh queries | A fresh query timed out while another thread waited for a forced download. | Fresh query completes during the download; simultaneous expired queries, separate processes, and the Windows swap remain serialized safely. |
+| Manual branch selection | Both workflows completed and would publish from a feature branch. | Both reject non-default branches before ingestion or publication. |
+| Installation order | Real ingestion ran the version installed before a simulated checkout update. | The initial pull precedes installation and real ingestion executes the updated checkout. |
+| Intervening unrelated push | A rejected push failed the run. | A bounded rebase/push retry succeeds without re-running ingestion or repeating the simulated notification; SQL and database retain its watermark. |
+| Intervening SQL change | Both workflows continued through publication despite a changed remote SQL baseline. | Both stop before push and upload; database and SQL with the delivery watermark are retained for a failed-run recovery artifact. |
+| Recovery baseline | The failed-run recovery output omitted the original revision. | The baseline revision is saved along with the database and SQL. |
+| Replacement during 304 | A database changed during the HTTP request was treated as fresh after the old ETag's 304. | A second fingerprint check reports a stale fallback; the following query retrieves the Release without the old ETag. |
+
+The first non-elevated manual-branch test run appeared green only because MinGit could not initialize; that was an invalid environmental result, not a behavioral green. Its elevated red and green runs above exercised the actual workflow scripts. The former fake-Python workflow harness has been replaced with real project ingestion, a simulated package installation, and fakes only at external boundaries. An offline real `pip` installation now exercises the generated `oss-intelligence-mcp` command, its help, and a real FastMCP stdio query. Search coverage now includes one independent nonmatching Repository for each filter. Both workflows share a small execution script while retaining their explicit schedules, permissions, and shared concurrency group.
+
+Failure artifacts are best-effort: a canceled/terminated runner or failed artifact upload can still lose unsaved delivery watermarks. If the run fails before its SQL export completes, the SQL file may be older than the preserved database. A maintainer must pause subsequent runs and reconcile the artifact against its baseline and the current default branch; otherwise already delivered notifications may be sent again. Push and Release upload are not atomic, and an independent program can still keep a Windows SQLite file open. No live GitHub Actions or real Release behavior has been exercised.
+
+The complete review-repair run on Windows/Python 3.13 finished with **79 passed, 1 warning** in 44.83 seconds; no tests were skipped. The warning is the existing Authlib deprecation from FastMCP 2.14.7. The two SDK directories are isolated from the unrelated bundled build tools; `MCP_TEST_BUILD_PATH` supplies setuptools only to the offline installation subprocess. The elevated PowerShell command was:
+
+```powershell
+$sdk05 = (Resolve-Path '.pytest_cache\ticket05-sdk').Path
+$sdk04 = (Resolve-Path '.pytest_cache\ticket04-sdk-30a99fa5bb764194965b42bca54efc13\packages').Path
+$env:PYTHONPATH = "$sdk05;$sdk05\win32;$sdk05\win32\lib;$sdk05\pywin32_system32;$sdk04"
+$env:MCP_TEST_BUILD_PATH = 'C:\Users\t\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\Lib\site-packages'
+Remove-Item Env:GITHUB_TOKEN,Env:GITHUB_REPOSITORY,Env:GITHUB_RELEASE_DB_URL,Env:APPRISE_URLS,Env:TRENDSHIFT_API_KEY -ErrorAction SilentlyContinue
+python -m pytest -v --basetemp .pytest_cache\ticket05-review-fix-full-20261105-a
+```
+
+Use a different exclusive `--basetemp` directory on another run.

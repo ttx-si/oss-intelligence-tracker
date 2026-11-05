@@ -4,5 +4,6 @@ __pycache__/
 *.db
 *.db.tmp
 *.db.lock
+*.db.sync.lock
 *.db.sync.json
 *.db.sync.json.tmp
