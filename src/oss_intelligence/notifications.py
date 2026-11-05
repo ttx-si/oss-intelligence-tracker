@@ -22,6 +22,24 @@ class AppriseProtocol(Protocol):
     def notify(self, *, title: str, body: str, body_format: str) -> AppriseResultProtocol: ...
 
 
+def _delivery_succeeded(result: AppriseResultProtocol) -> bool:
+    if not result:
+        return False
+
+    # Apprise 2.1's overall and per-service statuses tolerate optional failures.
+    # The raw final attempt records whether each dispatched service really
+    # accepted the digest; earlier failed attempts may have been retried.
+    try:
+        from apprise import AppriseResult
+    except ImportError:
+        return True  # Older Apprise versions return a plain boolean.
+    if isinstance(result, AppriseResult):
+        return bool(result.results) and all(
+            service.attempts and bool(service.attempts[-1]) for service in result.results
+        )
+    return True
+
+
 def _surging_qualifies(repo: RepositoryRecord) -> bool:
     if repo.lifecycle_state != "SURGING" or repo.surging_entered_at is None:
         return False
@@ -85,7 +103,7 @@ def deliver_batch_digest(
     except Exception as exc:
         logger.warning("Batch Digest delivery failed: error_type=%s", type(exc).__name__)
         return None
-    if delivered:
+    if _delivery_succeeded(delivered):
         store.mark_digest_notified(
             [repo.ghr_id for repo in surging],
             [repo.ghr_id for repo in curated],

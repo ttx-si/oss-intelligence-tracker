@@ -121,6 +121,7 @@ class IngestionPipeline:
         jitter_range_sec: tuple[float, float] = (0.100, 0.200),
         rng_fn: Callable[[float, float], float] = random.uniform,
         notifier: AppriseProtocol | None = None,
+        clock: Callable[[], str] = _utc_now,
     ) -> None:
         if signal_adapters is not None:
             self._signal_adapters: tuple[SignalAdapterProtocol, ...] = tuple(signal_adapters)
@@ -135,6 +136,7 @@ class IngestionPipeline:
         self._jitter_min_sec, self._jitter_max_sec = jitter_range_sec
         self._rng_fn = rng_fn
         self._notifier = notifier
+        self._clock = clock
 
     def _fetch_all_candidates_isolated(self) -> list[RawSignalCandidate]:
         all_candidates: list[RawSignalCandidate] = []
@@ -161,7 +163,7 @@ class IngestionPipeline:
 
     def run(self, captured_at: str | None = None, *, dry_run: bool = False) -> str | None:
         """Ingest and notify; an explicit captured_at fixes the clock for deterministic replay."""
-        timestamp = captured_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        timestamp = captured_at or self._clock()
         candidates = self._fetch_all_candidates_isolated()
         uncached_api_calls = 0
         seen_snapshots: set[tuple[int, str, str]] = set()
@@ -243,10 +245,10 @@ class IngestionPipeline:
                     period_stars_reported=candidate.period_stars_reported,
                 )
 
-        transition_timestamp = captured_at or _utc_now()
+        transition_timestamp = captured_at or self._clock()
         LifecycleStateMachine(self._store).evaluate(
             now=transition_timestamp,
-            transition_clock=_utc_now if not captured_at else None,
+            transition_clock=self._clock if not captured_at else None,
         )
         if self._notifier is not None or dry_run:
             return deliver_batch_digest(
@@ -254,6 +256,6 @@ class IngestionPipeline:
                 self._notifier,
                 transition_timestamp,
                 dry_run=dry_run,
-                delivery_clock=_utc_now if not captured_at else None,
+                delivery_clock=self._clock if not captured_at else None,
             )
         return None

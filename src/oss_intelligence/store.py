@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -154,9 +155,17 @@ class IntelligenceStore:
             ).fetchone()
         return self._row_to_repository(row) if row is not None else None
 
-    def save_repository(self, record: RepositoryRecord) -> None:
+    def save_repository(
+        self, record: RepositoryRecord, *, surging_entry_clock: Callable[[], str] | None = None
+    ) -> None:
         topics_json = json.dumps(list(record.topics), ensure_ascii=False)
         with self._session() as conn:
+            if surging_entry_clock is not None:
+                # Do not backdate the transition if another SQLite writer holds
+                # the lock while this update waits to begin.
+                conn.execute("BEGIN IMMEDIATE")
+                entered_at = surging_entry_clock()
+                record = replace(record, surging_entered_at=entered_at, last_updated_at=entered_at)
             conn.execute(
                 """
                 INSERT INTO repositories (

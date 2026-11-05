@@ -263,7 +263,7 @@ class LifecycleStateMachine:
             if next_state != "SURGING":
                 surging_entered_at = None
             elif repo.lifecycle_state != "SURGING":
-                surging_entered_at = transition_clock() if transition_clock is not None else timestamp
+                surging_entered_at = timestamp
             else:
                 surging_entered_at = repo.surging_entered_at or repo.last_notified_at or timestamp
 
@@ -281,4 +281,7 @@ class LifecycleStateMachine:
                     else timestamp
                 ),
             )
-            self._store.save_repository(updated)
+            if next_state == "SURGING" and repo.lifecycle_state != "SURGING" and transition_clock is not None:
+                self._store.save_repository(updated, surging_entry_clock=transition_clock)
+            else:
+                self._store.save_repository(updated)

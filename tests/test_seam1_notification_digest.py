@@ -8,8 +8,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import tomllib
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -205,29 +207,13 @@ def test_slow_delivery_starts_cooldown_when_the_notification_succeeds(
     assert store.get_repository_by_ghr_id(1).last_notified_at == "2026-11-04T02:00:00Z"
 
 
-def test_slow_lifecycle_evaluation_records_the_actual_surging_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    current_time = datetime(2026, 11, 4, 2, 59, tzinfo=timezone.utc)
-
-    class ControlledDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return current_time
-
-    class SlowStore(IntelligenceStore):
-        def list_snapshots(self, ghr_id=None):
-            nonlocal current_time
-            snapshots = super().list_snapshots(ghr_id)
-            current_time += timedelta(minutes=2)
-            return snapshots
-
-    monkeypatch.setattr("oss_intelligence.pipeline.datetime", ControlledDateTime)
-    store = SlowStore(tmp_path / "intelligence.db")
+def test_write_lock_wait_does_not_backdate_a_surging_entry(tmp_path: Path) -> None:
+    db_path = tmp_path / "intelligence.db"
+    store = IntelligenceStore(db_path)
     store.save_repository(
         RepositoryRecord(
             ghr_id=1,
-            full_name="org/slow-evaluation",
+            full_name="org/locked",
             description=None,
             primary_language="Python",
             license_spdx=None,
@@ -249,17 +235,34 @@ def test_slow_lifecycle_evaluation_records_the_actual_surging_entry(
             last_notified_state="SURGING",
         )
     )
-    notifier = SpyApprise()
+    current_time = "2026-11-04T02:59:00Z"
+    clock_seen = threading.Event()
 
-    IngestionPipeline(
-        store=store,
-        signal_adapters=[],
-        metadata_client=FakeGitHubMetadataClient({}),
-        notifier=notifier,
-    ).run()
+    def clock() -> str:
+        clock_seen.set()
+        return current_time
+
+    notifier = SpyApprise()
+    pipeline = IngestionPipeline(
+        store=store, signal_adapters=[], metadata_client=FakeGitHubMetadataClient({}),
+        notifier=notifier, clock=clock,
+    )
+
+    with sqlite3.connect(db_path) as lock, ThreadPoolExecutor(max_workers=1) as executor:
+        lock.execute("BEGIN IMMEDIATE")
+        future = executor.submit(pipeline.run)
+        try:
+            assert clock_seen.wait(timeout=5)
+            # Reads can proceed under this lock, but the state write cannot.
+            with pytest.raises(TimeoutError):
+                future.result(timeout=1)
+            current_time = "2026-11-04T03:01:00Z"
+        finally:
+            lock.rollback()
+        future.result(timeout=5)
 
     assert len(notifier.messages) == 1
-    assert "org/slow-evaluation" in notifier.messages[0]["body"]
+    assert "org/locked" in notifier.messages[0]["body"]
     assert store.get_repository_by_ghr_id(1).surging_entered_at == "2026-11-04T03:01:00Z"
 
 
@@ -354,8 +357,8 @@ def test_default_cli_path_declares_and_uses_gtrending(
     ), "A clean project installation must install a compatible gtrending distribution"
 
 
-def test_real_gtrending_adapter_parses_an_offline_http_response(
-    monkeypatch: pytest.MonkeyPatch,
+def test_pipeline_ingests_real_gtrending_with_an_offline_http_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("gtrending")
     import requests
@@ -371,14 +374,24 @@ def test_real_gtrending_adapter_parses_an_offline_http_response(
 """
     monkeypatch.setattr(requests, "get", lambda url: SimpleNamespace(text=html))
 
-    candidates = GtrendingAdapter().fetch_candidates()
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    notifier = SpyApprise()
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[GtrendingAdapter()],
+        metadata_client=FakeGitHubMetadataClient({"org/real-library": 1}),
+        notifier=notifier,
+    ).run(captured_at="2026-11-01T00:00:00Z")
 
-    assert len(candidates) == 1
-    assert candidates[0].full_name == "org/real-library"
-    assert candidates[0].signal_source == "gtrending"
-    assert candidates[0].stars == 1000
-    assert candidates[0].forks == 12
-    assert candidates[0].period_stars_reported == 200
+    assert len(notifier.messages) == 1
+    assert "org/real-library" in notifier.messages[0]["body"]
+    assert "+200 stars/24h" in notifier.messages[0]["body"]
+    snapshots = store.list_snapshots()
+    assert len(snapshots) == 1
+    assert snapshots[0].signal_source == "gtrending"
+    assert snapshots[0].stars == 1000
+    assert snapshots[0].forks == 12
+    assert snapshots[0].period_stars_reported == 200
 
 
 def test_successful_apprise_result_advances_watermarks(tmp_path: Path) -> None:
@@ -468,6 +481,101 @@ def test_unsuccessful_real_apprise_result_does_not_advance_watermarks(
     repository = store.get_repository_by_ghr_id(1)
     assert repository.last_notified_at == "2026-11-01T06:00:00Z"
     assert repository.last_curated_notified_at == "2026-11-01T06:00:00Z"
+
+
+@pytest.mark.parametrize("include_required", [False, True], ids=["optional-only", "mixed"])
+def test_failed_optional_apprise_delivery_is_retried_without_advancing_watermarks(
+    tmp_path: Path, include_required: bool
+) -> None:
+    apprise_sdk = pytest.importorskip("apprise")
+    if not hasattr(apprise_sdk, "AppriseResult"):
+        pytest.skip("Structured Apprise results are required to inspect optional failures")
+
+    class InMemoryService(apprise_sdk.NotifyBase):
+        service_name = "In-memory test service"
+
+        def __init__(self, *, optional: bool, succeeds: bool) -> None:
+            super().__init__(optional=optional)
+            self.succeeds = succeeds
+            self.messages: list[str] = []
+
+        def send(self, body: str, title: str = "", **kwargs) -> bool:
+            self.messages.append(body)
+            return self.succeeds
+
+    optional = InMemoryService(optional=True, succeeds=False)
+    notifier = apprise_sdk.Apprise()
+    if include_required:
+        assert notifier.add(InMemoryService(optional=False, succeeds=True))
+    assert notifier.add(optional)
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalSource(
+                [RawSignalCandidate(
+                    "org/optional", "gtrending", 1000,
+                    period_stars_reported=200, is_curated=True,
+                )]
+            )
+        ],
+        metadata_client=FakeGitHubMetadataClient({"org/optional": 1}),
+        notifier=notifier,
+    )
+
+    pipeline.run(captured_at="2026-11-01T00:00:00Z")
+    repository = store.get_repository_by_ghr_id(1)
+    assert len(optional.messages) == 1
+    assert repository.last_notified_at is None
+    assert repository.last_notified_state is None
+    assert repository.last_curated_notified_at is None
+
+    optional.succeeds = True
+    pipeline.run(captured_at="2026-11-01T06:00:00Z")
+    repository = store.get_repository_by_ghr_id(1)
+    assert len(optional.messages) == 2
+    assert repository.last_notified_at == "2026-11-01T06:00:00Z"
+    assert repository.last_curated_notified_at == "2026-11-01T06:00:00Z"
+
+
+def test_successful_apprise_retry_advances_watermarks(tmp_path: Path) -> None:
+    apprise_sdk = pytest.importorskip("apprise")
+    if not hasattr(apprise_sdk, "AppriseResult"):
+        pytest.skip("Structured Apprise results are required to inspect retries")
+
+    class InMemoryRetryService(apprise_sdk.NotifyBase):
+        service_name = "In-memory test service"
+
+        def __init__(self) -> None:
+            super().__init__(optional=True, retry=1, wait=0)
+            self.attempts = 0
+
+        def send(self, body: str, title: str = "", **kwargs) -> bool:
+            self.attempts += 1
+            return self.attempts > 1
+
+    service = InMemoryRetryService()
+    notifier = apprise_sdk.Apprise()
+    assert notifier.add(service)
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalSource(
+                [RawSignalCandidate(
+                    "org/apprise-retry", "gtrending", 1000,
+                    period_stars_reported=200, is_curated=True,
+                )]
+            )
+        ],
+        metadata_client=FakeGitHubMetadataClient({"org/apprise-retry": 1}),
+        notifier=notifier,
+    ).run(captured_at="2026-11-01T00:00:00Z")
+
+    assert service.attempts == 2
+    repository = store.get_repository_by_ghr_id(1)
+    assert repository.last_notified_at == "2026-11-01T00:00:00Z"
+    assert repository.last_curated_notified_at == "2026-11-01T00:00:00Z"
 
 
 def test_first_surging_repository_is_delivered_and_watermarked(tmp_path: Path) -> None:
