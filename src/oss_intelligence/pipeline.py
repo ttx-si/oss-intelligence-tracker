@@ -17,6 +17,7 @@ from oss_intelligence.models import (
     RepositoryRecord,
     is_trending_signal_source,
 )
+from oss_intelligence.notifications import AppriseProtocol, deliver_batch_digest
 from oss_intelligence.store import IntelligenceStore
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ class IngestionPipeline:
         sleep_fn: Callable[[float], None] = time.sleep,
         jitter_range_sec: tuple[float, float] = (0.100, 0.200),
         rng_fn: Callable[[float, float], float] = random.uniform,
+        notifier: AppriseProtocol | None = None,
     ) -> None:
         if signal_adapters is not None:
             self._signal_adapters: tuple[SignalAdapterProtocol, ...] = tuple(signal_adapters)
@@ -128,6 +130,7 @@ class IngestionPipeline:
         self._sleep_fn = sleep_fn
         self._jitter_min_sec, self._jitter_max_sec = jitter_range_sec
         self._rng_fn = rng_fn
+        self._notifier = notifier
 
     def _fetch_all_candidates_isolated(self) -> list[RawSignalCandidate]:
         all_candidates: list[RawSignalCandidate] = []
@@ -152,7 +155,7 @@ class IngestionPipeline:
                 )
         return all_candidates
 
-    def run(self, captured_at: str | None = None) -> None:
+    def run(self, captured_at: str | None = None, *, dry_run: bool = False) -> str | None:
         timestamp = captured_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         candidates = self._fetch_all_candidates_isolated()
         uncached_api_calls = 0
@@ -236,3 +239,6 @@ class IngestionPipeline:
                 )
 
         LifecycleStateMachine(self._store).evaluate(now=timestamp)
+        if self._notifier is not None or dry_run:
+            return deliver_batch_digest(self._store, self._notifier, timestamp, dry_run=dry_run)
+        return None

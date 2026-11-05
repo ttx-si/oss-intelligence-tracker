@@ -266,6 +266,13 @@ class LifecycleStateMachine:
             else:
                 next_state = "DISCOVERY"
 
+            if next_state != "SURGING":
+                surging_entered_at = None
+            elif repo.lifecycle_state != "SURGING":
+                surging_entered_at = timestamp
+            else:
+                surging_entered_at = repo.surging_entered_at or repo.last_notified_at or timestamp
+
             updated = replace(
                 repo,
                 stars_total=ev.latest_stars,
@@ -273,6 +280,7 @@ class LifecycleStateMachine:
                 stars_delta_24h=ev.delta_24h,
                 stars_delta_7d=ev.delta_7d,
                 lifecycle_state=next_state,
+                surging_entered_at=surging_entered_at,
                 last_updated_at=timestamp,
             )
             self._store.save_repository(updated)

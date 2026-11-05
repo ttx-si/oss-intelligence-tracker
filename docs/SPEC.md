@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS repositories (
     last_updated_at TEXT NOT NULL,
     last_notified_at TEXT,
     last_notified_state TEXT,
-    last_curated_notified_at TEXT
+    last_curated_notified_at TEXT,
+    surging_entered_at TEXT                       -- Current SURGING entry, for retries and cooldown
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -136,10 +137,13 @@ Every pipeline execution evaluates the state machine in two phases:
 
 ### 5. Notification Throttling & Batch Digest Rules (ADR-0005)
 - A **Repository** qualifies for the **Batch Digest** in a given run if and only if:
-  - **Condition 1 (Surging Breakout)**: `lifecycle_state == 'SURGING'` AND (`last_notified_state != 'SURGING'` OR `last_notified_state IS NULL`) AND (`last_notified_at IS NULL` OR `hours_since(last_notified_at) >= 72`); OR
+  - **Condition 1 (Surging Breakout)**: `lifecycle_state == 'SURGING'`, the current entry into `SURGING` has not been delivered, and either `last_notified_at IS NULL` or at least 72 hours elapsed between `last_notified_at` and `surging_entered_at`; OR
   - **Condition 2 (New Curation Highlight)**: `is_curated == 1` AND `last_curated_notified_at IS NULL`.
+- `surging_entered_at` records each actual entry into `SURGING` and is cleared upon leaving it. A continuously `SURGING` repository is not notified again when the clock reaches 72 hours. An entry within the cooldown is suppressed rather than deferred; after leaving `SURGING`, a new entry at or beyond the boundary may notify again. A qualifying entry remains eligible while `SURGING` if delivery fails or is skipped by `--dry-run`.
 - All qualifying repositories in the current batch are rendered into a single Markdown digest grouped into **"🚀 Surging Breakouts"** and **"✨ New Curated Highlights"** sections, sorted by `stars_delta_24h DESC`.
-- Watermarks (`last_notified_at = now`, `last_notified_state = lifecycle_state`, `last_curated_notified_at = now`) are updated in a single SQLite transaction only when `Apprise.notify()` returns `True`.
+- Only when `Apprise.notify()` returns `True`, update `last_notified_at = now` and `last_notified_state = 'SURGING'` for delivered breakouts and `last_curated_notified_at = now` for delivered Curation highlights, in a single SQLite transaction. A repository in both sections receives both updates. `surging_entered_at` records Lifecycle State and is not a delivery watermark.
+- Existing databases and SQL dumps without `surging_entered_at` are migrated. For a currently `SURGING` repository already carrying a notification timestamp, migration conservatively treats that timestamp as its entry; an unknown historical transition is not replayed.
+- Configure `APPRISE_URLS` with one Apprise URL per line and run `python -m oss_intelligence --database intelligence.db` (or the installed `oss-intelligence` command). Add `--dry-run` to preview the digest in UTF-8 without sending or changing notification watermarks; ingestion and Lifecycle State updates still occur. Add `--notifications-only` to process stored repositories without fetching Signal Sources.
 
 ### 6. Windows-Safe Local FastMCP Lazy Sync & Three-Tier Fallback (ADR-0004)
 - Before executing any MCP query tool, `ReleaseSyncManager` checks the local `.db` file's last-sync metadata timestamp against `MCP_SYNC_TTL_SECONDS` (default `3600`).

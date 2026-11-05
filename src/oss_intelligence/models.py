@@ -70,6 +70,7 @@ class RepositoryRecord:
     last_notified_at: str | None = None
     last_notified_state: str | None = None
     last_curated_notified_at: str | None = None
+    surging_entered_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

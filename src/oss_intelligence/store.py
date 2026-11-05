@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS repositories (
     last_updated_at TEXT NOT NULL,
     last_notified_at TEXT,
     last_notified_state TEXT,
-    last_curated_notified_at TEXT
+    last_curated_notified_at TEXT,
+    surging_entered_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -76,6 +77,7 @@ _REPO_COLUMNS = (
     "last_notified_at",
     "last_notified_state",
     "last_curated_notified_at",
+    "surging_entered_at",
 )
 
 _SNAPSHOT_EXPORT_COLUMNS = (
@@ -127,6 +129,14 @@ class IntelligenceStore:
     def _init_schema(self) -> None:
         with self._session() as conn:
             conn.executescript(SCHEMA_DDL)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(repositories)")}
+            if "surging_entered_at" not in columns:
+                conn.execute("ALTER TABLE repositories ADD COLUMN surging_entered_at TEXT")
+                # Existing notified surges must not be mistaken for a new transition.
+                conn.execute(
+                    "UPDATE repositories SET surging_entered_at = "
+                    "COALESCE(last_notified_at, last_updated_at) WHERE lifecycle_state = 'SURGING'"
+                )
 
     def get_repository_by_full_name(self, full_name: str) -> RepositoryRecord | None:
         with self._session() as conn:
@@ -155,8 +165,9 @@ class IntelligenceStore:
                     stars_delta_6h, stars_delta_24h, stars_delta_7d,
                     lifecycle_state, is_curated, curated_issue, curated_category,
                     first_seen_at, last_seen_in_trending_at, last_updated_at,
-                    last_notified_at, last_notified_state, last_curated_notified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_notified_at, last_notified_state, last_curated_notified_at,
+                    surging_entered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ghr_id) DO UPDATE SET
                     full_name = excluded.full_name,
                     description = excluded.description,
@@ -178,7 +189,8 @@ class IntelligenceStore:
                     last_updated_at = excluded.last_updated_at,
                     last_notified_at = excluded.last_notified_at,
                     last_notified_state = excluded.last_notified_state,
-                    last_curated_notified_at = excluded.last_curated_notified_at
+                    last_curated_notified_at = excluded.last_curated_notified_at,
+                    surging_entered_at = excluded.surging_entered_at
                 """,
                 (
                     record.ghr_id,
@@ -203,6 +215,7 @@ class IntelligenceStore:
                     record.last_notified_at,
                     record.last_notified_state,
                     record.last_curated_notified_at,
+                    record.surging_entered_at,
                 ),
             )
 
@@ -241,6 +254,21 @@ class IntelligenceStore:
                 "SELECT * FROM repositories ORDER BY ghr_id ASC"
             ).fetchall()
         return [self._row_to_repository(r) for r in rows]
+
+    def mark_digest_notified(
+        self, surging_ids: list[int], curated_ids: list[int], timestamp: str
+    ) -> None:
+        """Commit all delivery watermarks together after the Batch Digest succeeds."""
+        with self._session() as conn:
+            conn.executemany(
+                "UPDATE repositories SET last_notified_at = ?, last_notified_state = 'SURGING' "
+                "WHERE ghr_id = ?",
+                [(timestamp, ghr_id) for ghr_id in surging_ids],
+            )
+            conn.executemany(
+                "UPDATE repositories SET last_curated_notified_at = ? WHERE ghr_id = ?",
+                [(timestamp, ghr_id) for ghr_id in curated_ids],
+            )
 
     def list_snapshots(self, ghr_id: int | None = None) -> list[SnapshotRecord]:
         with self._session() as conn:
@@ -301,6 +329,7 @@ class IntelligenceStore:
                 """
             )
             conn.executescript(sql_text)
+        self._init_schema()
 
     @staticmethod
     def _row_to_repository(row: sqlite3.Row) -> RepositoryRecord:
@@ -328,6 +357,7 @@ class IntelligenceStore:
             last_notified_at=row["last_notified_at"],
             last_notified_state=row["last_notified_state"],
             last_curated_notified_at=row["last_curated_notified_at"],
+            surging_entered_at=row["surging_entered_at"],
         )
 
     @staticmethod
