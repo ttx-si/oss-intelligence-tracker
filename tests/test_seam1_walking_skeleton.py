@@ -404,7 +404,7 @@ def test_deterministic_sql_export_orders_by_ghr_id_asc_and_round_trips_cleanly(
     assert len(restored_store.list_snapshots(ghr_id=500)) == 1
 
 
-def test_gtrending_adapter_transforms_raw_trending_entries_into_candidates() -> None:
+def test_gtrending_adapter_transforms_raw_trending_entries_into_candidates(monkeypatch) -> None:
     raw_entries = [
         {
             "fullname": "ggerganov/llama.cpp",
@@ -417,7 +417,9 @@ def test_gtrending_adapter_transforms_raw_trending_entries_into_candidates() -> 
             "language": "C++",
         }
     ]
-    adapter = GtrendingAdapter(fetcher=lambda: raw_entries)
+    import gtrending
+    monkeypatch.setattr(gtrending, "fetch_repos", lambda language="", since="daily": raw_entries if since == "daily" else [])
+    adapter = GtrendingAdapter(languages=("", "c++"), since_windows=("daily", "weekly"))
     candidates = adapter.fetch_candidates()
 
     assert len(candidates) == 1

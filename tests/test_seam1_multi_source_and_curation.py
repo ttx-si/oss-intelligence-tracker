@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,26 +45,59 @@ class FakeGitHubMetadataClient:
 
 def test_github_search_spike_adapter_ingests_breakout_repos_with_gh_search_source(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = IntelligenceStore(tmp_path / "intelligence.db")
     captured_requests: list[dict[str, Any]] = []
 
-    def fake_search_fetcher(token: str | None, query: str) -> list[dict[str, Any]]:
-        captured_requests.append({"token": token, "query": query})
-        return [
+    def fake_search_urlopen(req, timeout=10.0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        captured_requests.append(
             {
-                "id": 901001,
-                "full_name": "browser-use/browser-use",
-                "stargazers_count": 3200,
-                "forks_count": 280,
-                "description": "Make websites accessible for AI agents",
-                "language": "Python",
+                "url": url,
+                "auth": req.get_header("Authorization"),
             }
-        ]
+        )
+        if "stars%3A%3E%3D50" in url:
+            items = [
+                {
+                    "id": 901001,
+                    "full_name": "browser-use/browser-use",
+                    "stargazers_count": 3000,
+                    "forks_count": 280,
+                    "created_at": "2026-10-29T00:00:00Z",  # 6 days before 2026-11-04 -> 500/day (SURGING)
+                    "description": "Make websites accessible for AI agents",
+                    "language": "Python",
+                },
+                {
+                    "id": 901002,
+                    "full_name": "org/six-day-steady",
+                    "stargazers_count": 300,
+                    "forks_count": 20,
+                    "created_at": "2026-10-29T00:00:00Z",  # 6 days before 2026-11-04 -> 50/day (DISCOVERY, not 300/day!)
+                    "description": "Steady 6-day repo",
+                    "language": "Go",
+                },
+            ]
+        else:
+            items = [
+                {
+                    "id": 901001,
+                    "full_name": "Browser-Use/Browser-Use",
+                    "stargazers_count": 3000,
+                    "forks_count": 280,
+                    "created_at": "2026-10-29T00:00:00Z",
+                    "description": "Make websites accessible for AI agents",
+                    "language": "Python",
+                }
+            ]
+        return io.BytesIO(json.dumps({"items": items}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_search_urlopen)
 
     gh_search_adapter = GitHubSearchSpikeAdapter(
         token="ghp_test_token_123",
-        fetcher=fake_search_fetcher,
+        now=datetime(2026, 11, 4, 0, 0, 0, tzinfo=timezone.utc),
     )
     metadata_client = FakeGitHubMetadataClient(
         {
@@ -70,10 +108,21 @@ def test_github_search_spike_adapter_ingests_breakout_repos_with_gh_search_sourc
                 primary_language="Python",
                 license_spdx="MIT",
                 topics=("ai", "browser", "agents"),
-                repo_created_at="2026-10-30T08:00:00Z",
-                stars_total=3200,
+                repo_created_at="2026-10-29T00:00:00Z",
+                stars_total=3000,
                 forks_total=280,
-            )
+            ),
+            "org/six-day-steady": RepositoryMetadata(
+                ghr_id=901002,
+                full_name="org/six-day-steady",
+                description="Steady 6-day repo",
+                primary_language="Go",
+                license_spdx="MIT",
+                topics=("go",),
+                repo_created_at="2026-10-29T00:00:00Z",
+                stars_total=300,
+                forks_total=20,
+            ),
         }
     )
 
@@ -85,41 +134,61 @@ def test_github_search_spike_adapter_ingests_breakout_repos_with_gh_search_sourc
     )
     pipeline.run(captured_at="2026-11-04T00:00:00Z")
 
-    assert len(captured_requests) == 1
-    assert captured_requests[0]["token"] == "ghp_test_token_123"
-    assert "created:>=" in captured_requests[0]["query"]
+    assert len(captured_requests) == 2
+    assert all(r["auth"] == "Bearer ghp_test_token_123" for r in captured_requests)
+    assert all("per_page=100" in r["url"] for r in captured_requests)
+    assert any("created%3A%3E%3D2026-10-28+stars%3A%3E%3D50" in r["url"] for r in captured_requests)
+    assert any("created%3A%3E%3D2026-10-05+stars%3A%3E%3D200" in r["url"] for r in captured_requests)
 
-    repos = store.list_repositories()
-    assert len(repos) == 1
-    assert repos[0].ghr_id == 901001
-    assert repos[0].full_name == "browser-use/browser-use"
-    assert repos[0].stars_total == 3200
+    browser_use = store.get_repository_by_ghr_id(901001)
+    assert browser_use is not None
+    assert browser_use.stars_total == 3000
+    assert browser_use.stars_delta_24h == 500
+    assert browser_use.lifecycle_state == "SURGING"
+
+    steady = store.get_repository_by_ghr_id(901002)
+    assert steady is not None
+    assert steady.stars_total == 300
+    assert steady.stars_delta_24h == 50
+    assert steady.lifecycle_state == "DISCOVERY"
 
     snapshots = store.list_snapshots(ghr_id=901001)
     assert len(snapshots) == 1
     assert snapshots[0].signal_source == "gh_search"
-    assert snapshots[0].stars == 3200
+    assert snapshots[0].stars == 3000
     assert snapshots[0].forks == 280
+    assert snapshots[0].period_stars_reported == 500
     assert snapshots[0].source_rank == 1
 
 
 def test_ossinsight_adapter_ingests_trending_metrics_with_ossinsight_source(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = IntelligenceStore(tmp_path / "intelligence.db")
 
-    ossinsight_adapter = OSSInsightAdapter(
-        fetcher=lambda: [
-            {
-                "repo_name": "duckdb/duckdb",
-                "stars": 24500,
-                "forks": 1950,
-                "stars_inc": 380,
-                "description": "DuckDB is an in-process SQL OLAP Database Management System",
-                "primary_language": "C++",
-            }
-        ]
+    ossinsight_payload = {
+        "type": "sql_endpoint",
+        "data": {
+            "columns": [{"col": "repo_name"}, {"col": "stars"}, {"col": "forks"}, {"col": "stars_inc"}],
+            "rows": [
+                {
+                    "repo_name": "duckdb/duckdb",
+                    "stars": 24500,
+                    "forks": 1950,
+                    "stars_inc": 380,
+                    "description": "DuckDB is an in-process SQL OLAP Database Management System",
+                    "primary_language": "C++",
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=10.0: io.BytesIO(json.dumps(ossinsight_payload).encode("utf-8")),
     )
+    ossinsight_adapter = OSSInsightAdapter()
     metadata_client = FakeGitHubMetadataClient(
         {
             "duckdb/duckdb": RepositoryMetadata(
@@ -156,6 +225,45 @@ def test_ossinsight_adapter_ingests_trending_metrics_with_ossinsight_source(
     assert snapshots[0].forks == 1950
     assert snapshots[0].period_stars_reported == 380
     assert snapshots[0].source_rank == 1
+
+
+def test_ossinsight_unavailable_data_quality_trips_circuit_breaker_with_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    unavailable_payload = {
+        "type": "sql_endpoint",
+        "data": {"columns": [], "rows": [], "result": {"row_count": 0}},
+        "data_quality": {
+            "status": "unavailable",
+            "metric": "github_event_derived_ranking",
+            "unavailable_since": "2026-03-01",
+            "reason": "capture of those events fell to roughly 0.3% of baseline",
+        },
+    }
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda req, timeout=10.0: io.BytesIO(json.dumps(unavailable_payload).encode("utf-8")),
+    )
+
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[OSSInsightAdapter()],
+        metadata_client=FakeGitHubMetadataClient({}),
+        sleep_fn=lambda _: None,
+    )
+    with caplog.at_level(logging.WARNING):
+        pipeline.run(captured_at="2026-11-04T00:00:00Z")
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warning_messages) == 1
+    assert "OSSInsightAdapter(ossinsight)" in warning_messages[0]
+    assert "2026-03-01" in warning_messages[0]
+    assert "0.3% of baseline" in warning_messages[0]
+    assert store.list_repositories() == []
 
 
 def test_hellogithub_adapter_updates_orthogonal_curation_without_overwriting_lifecycle_state(
@@ -495,3 +603,293 @@ def test_multi_source_deduplication_by_ghr_id_merges_repository_and_records_sour
     assert "gh_search" in sources
     assert "ossinsight" in sources
     assert len(set(sources)) == len(sources)
+
+
+def test_hellogithub_two_stage_issue_discovery_click_redirects_and_nocase_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    # Pre-save repository with mixed casing to verify COLLATE NOCASE lookup
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=555666777,
+            full_name="Clainstone/CBirds",
+            description="Existing mixed-case repo",
+            primary_language="C",
+            license_spdx="MIT",
+            topics=("terminal", "c"),
+            repo_created_at="2026-01-01T00:00:00Z",
+            stars_total=1200,
+            forks_total=80,
+            stars_delta_6h=10,
+            stars_delta_24h=40,
+            stars_delta_7d=200,
+            lifecycle_state="DISCOVERY",
+            is_curated=False,
+            curated_issue=None,
+            curated_category=None,
+            first_seen_at="2026-11-01T00:00:00Z",
+            last_seen_in_trending_at="2026-11-03T18:00:00Z",
+            last_updated_at="2026-11-03T18:00:00Z",
+        )
+    )
+
+    readme_index = """\
+# HelloGitHub
+| [第 127 期](/content/HelloGitHub127.md) | [第 126 期](/content/HelloGitHub126.md) | [第 125 期](/content/HelloGitHub125.md) |
+"""
+    issue_127 = """\
+# 《HelloGitHub》第 127 期
+### C 项目
+1、[cbirds](https://hellogithub.com/periodical/statistics/click?target=https://github.com/clainstone/cbirds)：终端里看鸟群飞舞。
+### 人工智能
+2、[EditHere](https://hellogithub.com/periodical/statistics/click?target=https%3A%2F%2Fgithub.com%2FInginnng%2FEditHere)：用截图告诉 AI 该怎么改。
+"""
+    issue_125 = """\
+# 《HelloGitHub》第 125 期
+### C 项目
+1、[cbirds](https://hellogithub.com/periodical/statistics/click?target=https://github.com/clainstone/cbirds)：旧期重复条目应保留最新期号。
+### Python 项目
+2、[markitdown](https://github.com/microsoft/markitdown)：文档转 Markdown 工具。
+"""
+    fetched_urls: list[str] = []
+
+    def fake_urlopen(req, timeout=10.0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        fetched_urls.append(url)
+        if url.endswith("/README.md"):
+            return io.BytesIO(readme_index.encode("utf-8"))
+        if url.endswith("/content/HelloGitHub127.md"):
+            return io.BytesIO(issue_127.encode("utf-8"))
+        if url.endswith("/content/HelloGitHub126.md"):
+            raise OSError("Simulated transient 503 on issue 126")
+        if url.endswith("/content/HelloGitHub125.md"):
+            return io.BytesIO(issue_125.encode("utf-8"))
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    metadata_client = FakeGitHubMetadataClient(
+        {
+            "Inginnng/EditHere": RepositoryMetadata(
+                ghr_id=777888999,
+                full_name="Inginnng/EditHere",
+                description="Edit with AI via screenshots",
+                primary_language="C++",
+                license_spdx="MIT",
+                topics=("ai", "gui"),
+                repo_created_at="2026-10-15T00:00:00Z",
+                stars_total=850,
+                forks_total=45,
+            ),
+            "microsoft/markitdown": RepositoryMetadata(
+                ghr_id=910203040,
+                full_name="microsoft/markitdown",
+                description="Convert files to Markdown",
+                primary_language="Python",
+                license_spdx="MIT",
+                topics=("markdown", "python"),
+                repo_created_at="2026-10-20T00:00:00Z",
+                stars_total=5400,
+                forks_total=310,
+            ),
+        }
+    )
+
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[HelloGitHubAdapter(max_issues=3)],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    )
+    pipeline.run(captured_at="2026-11-04T00:00:00Z")
+
+    # Clainstone/CBirds matched case-insensitively without calling metadata_client
+    assert metadata_client.calls == ["Inginnng/EditHere", "microsoft/markitdown"]
+    assert any(u.endswith("/content/HelloGitHub127.md") for u in fetched_urls)
+    assert any(u.endswith("/content/HelloGitHub126.md") for u in fetched_urls)
+    assert any(u.endswith("/content/HelloGitHub125.md") for u in fetched_urls)
+
+    cbirds = store.get_repository_by_ghr_id(555666777)
+    assert cbirds is not None
+    assert cbirds.is_curated is True
+    assert cbirds.curated_issue == "vol-127"
+    assert cbirds.curated_category == "C 项目"
+
+    edithere = store.get_repository_by_ghr_id(777888999)
+    assert edithere is not None
+    assert edithere.is_curated is True
+    assert edithere.curated_issue == "vol-127"
+    assert edithere.curated_category == "人工智能"
+
+    markitdown = store.get_repository_by_ghr_id(910203040)
+    assert markitdown is not None
+    assert markitdown.is_curated is True
+    assert markitdown.curated_issue == "vol-125"
+    assert markitdown.curated_category == "Python 项目"
+
+
+def test_gtrending_multi_language_daily_weekly_matrix_and_velocity_normalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gtrending
+
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    calls: list[tuple[str, str]] = []
+
+    def fake_fetch_repos(language: str = "", spoken_language_code: str = "", since: str = "daily"):
+        calls.append((language, since))
+        if language == "rust" and since == "daily":
+            raise RuntimeError("Simulated transient GitHub Trending 502 on rust daily")
+        if language == "" and since == "daily":
+            return [
+                {
+                    "fullname": "astral-sh/uv",
+                    "stars": 28400,
+                    "forks": 810,
+                    "currentPeriodStars": 220,
+                    "description": None,
+                    "language": None,
+                }
+            ]
+        if language == "python" and since == "weekly":
+            return [
+                {
+                    "fullname": "Astral-sh/UV",
+                    "stars": 28500,
+                    "forks": 820,
+                    "currentPeriodStars": 1400,
+                    "description": "An extremely fast Python package manager",
+                    "language": "Rust",
+                },
+                {
+                    "fullname": "org/weekly-steady",
+                    "stars": 1500,
+                    "forks": 120,
+                    "currentPeriodStars": 700,  # 700 / 7 = 100/day (< 150 cold-start SURGING threshold)
+                    "description": "Steady weekly mover",
+                    "language": "Python",
+                },
+            ]
+        return []
+
+    monkeypatch.setattr(gtrending, "fetch_repos", fake_fetch_repos)
+
+    adapter = GtrendingAdapter(languages=("", "python", "rust"), since_windows=("daily", "weekly"))
+    metadata_client = FakeGitHubMetadataClient(
+        {
+            "astral-sh/uv": RepositoryMetadata(
+                ghr_id=754891001,
+                full_name="astral-sh/uv",
+                description="An extremely fast Python package manager",
+                primary_language="Rust",
+                license_spdx="MIT",
+                topics=("python", "rust"),
+                repo_created_at="2024-01-15T10:00:00Z",
+                stars_total=28500,
+                forks_total=820,
+            ),
+            "org/weekly-steady": RepositoryMetadata(
+                ghr_id=888000111,
+                full_name="org/weekly-steady",
+                description="Steady weekly mover",
+                primary_language="Python",
+                license_spdx="MIT",
+                topics=("python",),
+                repo_created_at="2025-05-01T00:00:00Z",
+                stars_total=1500,
+                forks_total=120,
+            ),
+        }
+    )
+
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[adapter],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    )
+    pipeline.run(captured_at="2026-11-04T00:00:00Z")
+
+    assert len(calls) == 6
+    assert ("", "daily") in calls
+    assert ("python", "weekly") in calls
+
+    uv = store.get_repository_by_ghr_id(754891001)
+    assert uv is not None
+    assert uv.stars_total == 28500
+    assert uv.forks_total == 820
+    # Preserved daily's 220/day instead of overwriting with weekly's 1400/7 = 200
+    assert uv.stars_delta_24h == 220
+    assert uv.lifecycle_state == "SURGING"
+
+    weekly_steady = store.get_repository_by_ghr_id(888000111)
+    assert weekly_steady is not None
+    # Normalized 700 weekly stars -> 100 daily stars, preventing false-positive SURGING
+    assert weekly_steady.stars_delta_24h == 100
+    assert weekly_steady.lifecycle_state == "DISCOVERY"
+
+
+def test_pipeline_skips_deleted_or_unresolvable_repository_metadata_with_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+
+    class NotFoundMetadataClient(FakeGitHubMetadataClient):
+        def get_repository_metadata(self, full_name: str) -> RepositoryMetadata:
+            self.calls.append(full_name)
+            if full_name == "deleted-owner/vanished-repo":
+                raise urllib.error.HTTPError(
+                    f"https://api.github.com/repos/{full_name}",
+                    404,
+                    "Not Found",
+                    {},  # type: ignore[arg-type]
+                    None,
+                )
+            return self._mapping[full_name]
+
+    metadata_client = NotFoundMetadataClient(
+        {
+            "astral-sh/uv": RepositoryMetadata(
+                ghr_id=754891001,
+                full_name="astral-sh/uv",
+                description="Fast Python package manager",
+                primary_language="Rust",
+                license_spdx="MIT",
+                topics=("python", "rust"),
+                repo_created_at="2024-01-15T10:00:00Z",
+                stars_total=28500,
+                forks_total=820,
+            )
+        }
+    )
+    adapter = HelloGitHubAdapter(
+        markdown_fetcher=lambda: (
+            "# HelloGitHub 第 127 期\n"
+            "### Python 项目\n"
+            "1、[vanished](https://github.com/deleted-owner/vanished-repo)：已删除项目。\n"
+            "2、[uv](https://github.com/astral-sh/uv)：极速包管理器。\n"
+        )
+    )
+    sleeps: list[float] = []
+    pipeline = IngestionPipeline(
+        store=store,
+        signal_adapters=[adapter],
+        metadata_client=metadata_client,
+        sleep_fn=sleeps.append,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        pipeline.run(captured_at="2026-11-04T00:00:00Z")
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("deleted-owner/vanished-repo" in msg and "404" in msg for msg in warning_messages)
+    assert len(sleeps) == 1
+    repos = store.list_repositories()
+    assert [r.full_name for r in repos] == ["astral-sh/uv"]
+
+
+

@@ -801,3 +801,164 @@ def test_environment_ttl_is_honored_by_all_query_tools(tmp_path: Path, monkeypat
     now[0] += 1
     service.search_repositories()
     assert len(endpoint.requests) == 2
+
+
+def test_multi_board_attribution_categorization_filtering_and_metadata_breakdowns(
+    tmp_path: Path,
+) -> None:
+    from oss_intelligence.mcp_server import create_mcp_server
+
+    release_db = tmp_path / "release.db"
+    store = IntelligenceStore(release_db)
+
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=101,
+            full_name="browser-use/browser-use",
+            description="Make websites accessible for AI agents and LLM workflows",
+            primary_language="Python",
+            license_spdx="MIT",
+            topics=("ai", "agents", "llm", "mcp"),
+            repo_created_at="2026-10-25T00:00:00Z",  # 10 days before last_updated_at -> is_new_breakout=True
+            stars_total=4500,
+            forks_total=320,
+            stars_delta_6h=120,
+            stars_delta_24h=520,
+            stars_delta_7d=2800,
+            lifecycle_state="SURGING",
+            is_curated=True,
+            curated_issue="vol-127",
+            curated_category="人工智能",
+            first_seen_at="2026-11-01T00:00:00Z",
+            last_seen_in_trending_at="2026-11-04T00:00:00Z",
+            last_updated_at="2026-11-04T00:00:00Z",
+        )
+    )
+    store.add_snapshot(
+        ghr_id=101,
+        captured_at="2026-11-04T00:00:00Z",
+        signal_source="gtrending",
+        stars=4500,
+        forks=320,
+        source_rank=1,
+        period_stars_reported=520,
+    )
+    store.add_snapshot(
+        ghr_id=101,
+        captured_at="2026-11-04T00:00:00Z",
+        signal_source="gh_search",
+        stars=4500,
+        forks=320,
+        source_rank=1,
+        period_stars_reported=450,
+    )
+    store.add_snapshot(
+        ghr_id=101,
+        captured_at="2026-11-04T00:00:00Z",
+        signal_source="hellogithub",
+        stars=4500,
+        forks=320,
+        source_rank=2,
+        period_stars_reported=0,
+    )
+
+    store.save_repository(
+        RepositoryRecord(
+            ghr_id=102,
+            full_name="duckdb/duckdb",
+            description="DuckDB is an in-process SQL OLAP Database Management System",
+            primary_language="C++",
+            license_spdx="MIT",
+            topics=("database", "sql", "olap"),
+            repo_created_at="2018-06-25T00:00:00Z",  # Old repo -> is_new_breakout=False
+            stars_total=24500,
+            forks_total=1950,
+            stars_delta_6h=20,
+            stars_delta_24h=85,
+            stars_delta_7d=480,
+            lifecycle_state="SUSTAINED",
+            is_curated=False,
+            curated_issue=None,
+            curated_category=None,
+            first_seen_at="2026-10-20T00:00:00Z",
+            last_seen_in_trending_at="2026-11-04T00:00:00Z",
+            last_updated_at="2026-11-04T00:00:00Z",
+        )
+    )
+    store.add_snapshot(
+        ghr_id=102,
+        captured_at="2026-11-04T00:00:00Z",
+        signal_source="gtrending",
+        stars=24500,
+        forks=1950,
+        source_rank=4,
+        period_stars_reported=85,
+    )
+
+    endpoint = ReleaseEndpoint(release_db.read_bytes())
+    service = IntelligenceService(
+        database=tmp_path / "intelligence.db",
+        release_url="https://example.invalid/intelligence.db",
+        opener=endpoint,
+        clock=lambda: 10000.0,
+    )
+
+    all_res = service.search_repositories()
+    assert all_res["metadata"]["total_returned"] == 2
+    assert all_res["metadata"]["sources_breakdown"] == {
+        "gtrending": 2,
+        "gh_search": 1,
+        "hellogithub": 1,
+    }
+    assert all_res["metadata"]["categories_breakdown"] == {
+        "AI / Agents & LLM": 1,
+        "Data, Storage & Database": 1,
+    }
+
+    ai_repo = all_res["repositories"][0]
+    assert ai_repo["full_name"] == "browser-use/browser-use"
+    assert ai_repo["url"] == "https://github.com/browser-use/browser-use"
+    assert ai_repo["topics"] == ["ai", "agents", "llm", "mcp"]
+    assert ai_repo["signal_sources"] == ["gh_search", "gtrending", "hellogithub"]
+    assert ai_repo["category"] == "AI / Agents & LLM"
+    assert ai_repo["is_new_breakout"] is True
+
+    db_repo = all_res["repositories"][1]
+    assert db_repo["full_name"] == "duckdb/duckdb"
+    assert db_repo["url"] == "https://github.com/duckdb/duckdb"
+    assert db_repo["topics"] == ["database", "sql", "olap"]
+    assert db_repo["signal_sources"] == ["gtrending"]
+    assert db_repo["category"] == "Data, Storage & Database"
+    assert db_repo["is_new_breakout"] is False
+
+    # Filter by source
+    gh_search_only = service.search_repositories(source="gh_search")
+    assert [r["full_name"] for r in gh_search_only["repositories"]] == ["browser-use/browser-use"]
+    assert gh_search_only["metadata"]["total_returned"] == 1
+
+    # Filter by category
+    data_only = service.search_repositories(category="database")
+    assert [r["full_name"] for r in data_only["repositories"]] == ["duckdb/duckdb"]
+
+    # Trajectory enrichment
+    traj = service.get_repo_trajectory(101)
+    assert traj["repository"]["url"] == "https://github.com/browser-use/browser-use"
+    assert traj["repository"]["signal_sources"] == ["gh_search", "gtrending", "hellogithub"]
+    assert traj["repository"]["category"] == "AI / Agents & LLM"
+    assert traj["repository"]["is_new_breakout"] is True
+    assert len(traj["snapshots"]) == 3
+
+    # Verify FastMCP tool wrapper accepts source and category filters
+    fastmcp = pytest.importorskip("fastmcp")
+    server = create_mcp_server(service)
+
+    async def exercise_mcp():
+        async with fastmcp.Client(server) as client:
+            res = await client.call_tool(
+                "search_repositories",
+                {"source": "hellogithub", "category": "AI"},
+            )
+            assert [r["full_name"] for r in res.data["repositories"]] == ["browser-use/browser-use"]
+
+    asyncio.run(exercise_mcp())
+

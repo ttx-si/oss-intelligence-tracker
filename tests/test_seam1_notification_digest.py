@@ -317,7 +317,7 @@ def test_default_cli_path_declares_and_uses_gtrending(
         sys.modules,
         "gtrending",
         SimpleNamespace(
-            fetch_repos=lambda: [
+            fetch_repos=lambda *args, **kwargs: [
                 {"fullname": "org/default-source", "stars": 1000, "currentPeriodStars": 200}
             ]
         ),

@@ -21,6 +21,11 @@ def _default_ossinsight_fetcher(
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
         payload: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
+    data_quality = payload.get("data_quality")
+    if isinstance(data_quality, dict) and data_quality.get("status") == "unavailable":
+        since = data_quality.get("unavailable_since", "unknown")
+        reason = data_quality.get("reason", "upstream metric unavailable")
+        raise RuntimeError(f"OSSInsight endpoint unavailable since {since}: {reason}")
     data = payload.get("data") or {}
     rows: list[dict[str, Any]] = data.get("rows") if isinstance(data, dict) else []
     return rows or []

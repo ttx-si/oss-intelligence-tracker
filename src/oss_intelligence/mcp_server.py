@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from pathlib import Path
 from contextlib import contextmanager
@@ -108,6 +109,137 @@ def _exclusive_database_lock(database: Path):
 
 def _exclusive_sync_lock(database: Path):
     return _exclusive_lock(database.with_name(database.name + ".sync.lock"))
+
+
+_CATEGORY_RULES: tuple[tuple[str, set[str], tuple[str, ...]], ...] = (
+    (
+        "AI / Agents & LLM",
+        {
+            "ai", "llm", "llms", "agent", "agents", "mcp", "rag", "openai",
+            "anthropic", "claude", "gpt", "deepseek", "transformer", "diffusion",
+            "vllm", "ollama", "langchain", "llamaindex", "autogen", "embedding",
+            "embeddings", "neural", "pytorch", "tensorflow",
+        },
+        (
+            "model-context-protocol", "machine-learning", "deep-learning",
+            "artificial intelligence", "language model", "人工智能", "大模型",
+            "机器学习", "深度学习",
+        ),
+    ),
+    (
+        "Data, Storage & Database",
+        {
+            "database", "databases", "sql", "olap", "oltp", "postgres",
+            "postgresql", "sqlite", "mysql", "duckdb", "clickhouse", "redis",
+            "storage", "parquet", "arrow", "etl", "nosql",
+        },
+        (
+            "key-value", "vector-database", "data-engineering", "time-series",
+            "distributed-database", "数据库", "存储",
+        ),
+    ),
+    (
+        "Security & Privacy",
+        {
+            "security", "cryptography", "encryption", "decryption", "pentest",
+            "vulnerability", "cybersecurity", "oauth", "tls", "ssl", "firewall",
+            "privacy", "openssl",
+        },
+        ("zero-trust", "安全", "加密"),
+    ),
+    (
+        "Mobile & Desktop Apps",
+        {
+            "android", "ios", "flutter", "swiftui", "electron", "tauri",
+            "macos", "multimedia", "mpv",
+        },
+        ("react-native", "kotlin-multiplatform", "desktop-app", "mobile-app", "media-player"),
+    ),
+    (
+        "Web & Frontend",
+        {
+            "frontend", "react", "vue", "svelte", "nextjs", "angular",
+            "tailwindcss", "css", "pwa", "webgl", "threejs", "dom", "ui",
+        },
+        ("web-framework", "ui-components", "web-performance", "前端"),
+    ),
+    (
+        "Backend, Cloud & Infra",
+        {
+            "kubernetes", "k8s", "docker", "container", "containers", "cncf",
+            "microservices", "serverless", "terraform", "devops", "prometheus",
+            "monitoring", "grpc", "raft", "consensus",
+        },
+        ("cloud-native", "reverse-proxy", "load-balancer", "distributed-systems"),
+    ),
+    (
+        "DevTools & Coding",
+        {
+            "linter", "formatter", "compiler", "ide", "editor", "neovim",
+            "vscode", "cli", "terminal", "tui", "shell", "nushell", "debugger",
+            "git", "testing", "benchmark", "zed", "ruff",
+        },
+        ("text-editor", "static-analysis", "package-manager", "visual-studio-code", "build-tool"),
+    ),
+)
+
+
+def _classify_category(row: dict, topics: list[str]) -> str:
+    text_blob = " ".join(
+        str(part)
+        for part in (
+            " ".join(topics),
+            row.get("description") or "",
+            row.get("curated_category") or "",
+        )
+        if part
+    ).lower()
+    words = set(re.findall(r"[a-z0-9]+", text_blob)) | {t.lower() for t in topics}
+    for label, word_tokens, phrases in _CATEGORY_RULES:
+        if words & word_tokens or any(phrase in text_blob for phrase in phrases):
+            return label
+
+    curated_cat = str(row.get("curated_category") or "").strip()
+    if curated_cat and curated_cat != "Uncategorized":
+        return curated_cat
+    lang = str(row.get("primary_language") or "").strip()
+    if lang:
+        return f"{lang} Ecosystem"
+    return "General Open Source"
+
+
+def _is_new_breakout(repo_created_at: str | None, last_updated_at: str | None) -> bool:
+    if not repo_created_at or not last_updated_at:
+        return False
+    try:
+        created_dt = datetime.fromisoformat(repo_created_at.strip().replace("Z", "+00:00"))
+        updated_dt = datetime.fromisoformat(last_updated_at.strip().replace("Z", "+00:00"))
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        if updated_dt.tzinfo is None:
+            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+        age_seconds = (updated_dt - created_dt).total_seconds()
+        return 0.0 <= age_seconds <= 30.0 * 86400.0
+    except ValueError:
+        return False
+
+
+def _enrich_repository(row: sqlite3.Row | dict, signal_sources: list[str]) -> dict:
+    item = dict(row)
+    try:
+        raw_topics = json.loads(item.get("topics_json") or "[]")
+        topics = [str(t) for t in raw_topics] if isinstance(raw_topics, list) else []
+    except ValueError:
+        topics = []
+    item["url"] = f"https://github.com/{item['full_name']}"
+    item["topics"] = topics
+    item["signal_sources"] = list(signal_sources)
+    item["category"] = _classify_category(item, topics)
+    item["is_new_breakout"] = _is_new_breakout(
+        item.get("repo_created_at"),
+        item.get("last_updated_at"),
+    )
+    return item
 
 
 class IntelligenceService:
@@ -242,7 +374,8 @@ class IntelligenceService:
     def search_repositories(
         self, language: str | None = None, state: str | None = None,
         curated: bool | None = None, keyword: str | None = None,
-        min_stars_delta_24h: int | None = None, limit: int = 50,
+        min_stars_delta_24h: int | None = None, source: str | None = None,
+        category: str | None = None, limit: int = 50,
     ) -> dict:
         conditions = ["1 = 1"]
         parameters: list = []
@@ -261,17 +394,69 @@ class IntelligenceService:
         if keyword:
             conditions.append("instr(lower(full_name || ' ' || coalesce(description, '') || ' ' || topics_json), lower(?)) > 0")
             parameters.append(keyword)
-        parameters.append(max(1, min(limit, 500)))
+        if source:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM snapshots s WHERE s.ghr_id = repositories.ghr_id "
+                "AND lower(s.signal_source) = lower(?))"
+            )
+            parameters.append(source.strip())
+        clamped_limit = max(1, min(limit, 500))
+        sql = (
+            "SELECT * FROM repositories WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY stars_delta_24h DESC, ghr_id ASC"
+        )
+        if not category:
+            sql += " LIMIT ?"
+            parameters.append(clamped_limit)
+
         _, metadata = self._ready()
         with _exclusive_database_lock(self.database):
             conn = sqlite3.connect(self.database)
             conn.row_factory = sqlite3.Row
             try:
-                rows = conn.execute(
-                    "SELECT * FROM repositories WHERE " + " AND ".join(conditions)
-                    + " ORDER BY stars_delta_24h DESC, ghr_id ASC LIMIT ?", parameters,
-                ).fetchall()
-                return {"repositories": [dict(row) for row in rows], "metadata": metadata}
+                rows = conn.execute(sql, parameters).fetchall()
+                ghr_ids = [int(r["ghr_id"]) for r in rows]
+                sources_by_id: dict[int, list[str]] = {gid: [] for gid in ghr_ids}
+                if ghr_ids:
+                    placeholders = ", ".join("?" for _ in ghr_ids)
+                    snap_rows = conn.execute(
+                        f"SELECT DISTINCT ghr_id, signal_source FROM snapshots "
+                        f"WHERE ghr_id IN ({placeholders}) ORDER BY ghr_id ASC, signal_source ASC",
+                        ghr_ids,
+                    ).fetchall()
+                    for srow in snap_rows:
+                        sources_by_id.setdefault(int(srow["ghr_id"]), []).append(
+                            str(srow["signal_source"])
+                        )
+                enriched = [
+                    _enrich_repository(row, sources_by_id.get(int(row["ghr_id"]), []))
+                    for row in rows
+                ]
+                if category:
+                    needle = category.strip().lower()
+                    enriched = [
+                        repo
+                        for repo in enriched
+                        if needle in repo["category"].lower()
+                        or needle in str(repo.get("curated_category") or "").lower()
+                    ][:clamped_limit]
+
+                sources_breakdown: dict[str, int] = {}
+                categories_breakdown: dict[str, int] = {}
+                for repo in enriched:
+                    for src in repo["signal_sources"]:
+                        sources_breakdown[src] = sources_breakdown.get(src, 0) + 1
+                    cat = repo["category"]
+                    categories_breakdown[cat] = categories_breakdown.get(cat, 0) + 1
+
+                enriched_metadata = {
+                    **metadata,
+                    "total_returned": len(enriched),
+                    "sources_breakdown": sources_breakdown,
+                    "categories_breakdown": categories_breakdown,
+                }
+                return {"repositories": enriched, "metadata": enriched_metadata}
             finally:
                 conn.close()
 
@@ -289,7 +474,13 @@ class IntelligenceService:
                     "SELECT * FROM snapshots WHERE ghr_id = ? "
                     "ORDER BY captured_at ASC, signal_source ASC, id ASC", (ghr_id,),
                 ).fetchall()
-                return {"repository": dict(repository) if repository else None,
+                distinct_sources = sorted({str(r["signal_source"]) for r in rows})
+                enriched_repo = (
+                    _enrich_repository(repository, distinct_sources)
+                    if repository is not None
+                    else None
+                )
+                return {"repository": enriched_repo,
                         "snapshots": [dict(row) for row in rows], "metadata": metadata}
             finally:
                 conn.close()
@@ -345,15 +536,17 @@ def create_mcp_server(service: IntelligenceService):
     async def get_surging_repos() -> dict:
         return await asyncio.to_thread(service.get_surging_repos)
 
-    @server.tool(description="Filter Repositories by language, Lifecycle State, Curation, keyword and star velocity.")
+    @server.tool(description="Filter Repositories by language, Lifecycle State, Curation, Signal Source, domain category, keyword and star velocity.")
     async def search_repositories(
         language: str | None = None, state: str | None = None,
         curated: bool | None = None, keyword: str | None = None,
-        min_stars_delta_24h: int | None = None, limit: int = 50,
+        min_stars_delta_24h: int | None = None, source: str | None = None,
+        category: str | None = None, limit: int = 50,
     ) -> dict:
         return await asyncio.to_thread(
             service.search_repositories, language=language, state=state, curated=curated,
-            keyword=keyword, min_stars_delta_24h=min_stars_delta_24h, limit=limit,
+            keyword=keyword, min_stars_delta_24h=min_stars_delta_24h, source=source,
+            category=category, limit=limit,
         )
 
     @server.tool(description="List curated Repository highlights.")

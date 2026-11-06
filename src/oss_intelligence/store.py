@@ -142,7 +142,7 @@ class IntelligenceStore:
     def get_repository_by_full_name(self, full_name: str) -> RepositoryRecord | None:
         with self._session() as conn:
             row = conn.execute(
-                "SELECT * FROM repositories WHERE full_name = ?",
+                "SELECT * FROM repositories WHERE full_name = ? COLLATE NOCASE",
                 (full_name,),
             ).fetchone()
         return self._row_to_repository(row) if row is not None else None

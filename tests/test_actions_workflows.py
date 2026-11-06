@@ -11,6 +11,7 @@ import subprocess
 import sys
 
 import pytest
+from oss_intelligence.store import IntelligenceStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +55,9 @@ class WorkflowRun:
         self.hooks_file.write_text("[]", encoding="utf-8")
 
         shutil.copytree(ROOT / "src", self.directory / "src")
-        shutil.copytree(ROOT / "data", self.directory / "data")
+        init_db = tmp_path / "empty_init.db"
+        IntelligenceStore(init_db).export_sql_dump(self.directory / "data/schema_data.sql")
+        init_db.unlink(missing_ok=True)
         shutil.copytree(ROOT / ".github/scripts", self.directory / ".github/scripts")
 
         self.git_env = os.environ.copy()
@@ -111,7 +114,7 @@ class WorkflowRun:
 
         (boundary / "gtrending.py").write_text(
             "import os\n"
-            "def fetch_repos():\n"
+            "def fetch_repos(language='', spoken_language_code='', since='daily', *args, **kwargs):\n"
             "    if os.environ.get('EMPTY_SIGNALS') == '1':\n"
             "        return []\n"
             "    return [{'fullname': 'org/demo', 'stars': 500, 'currentPeriodStars': 200}]\n",

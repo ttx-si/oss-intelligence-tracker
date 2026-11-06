@@ -184,8 +184,16 @@ class IngestionPipeline:
                     delay_sec = self._rng_fn(self._jitter_min_sec, self._jitter_max_sec)
                     self._sleep_fn(delay_sec)
 
-                metadata = self._metadata_client.get_repository_metadata(candidate.full_name)
                 uncached_api_calls += 1
+                try:
+                    metadata = self._metadata_client.get_repository_metadata(candidate.full_name)
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        "Failed to resolve GitHub repository metadata for %s: %s",
+                        candidate.full_name,
+                        exc,
+                    )
+                    continue
 
                 existing_by_id = self._store.get_repository_by_ghr_id(metadata.ghr_id)
                 if existing_by_id is not None:
