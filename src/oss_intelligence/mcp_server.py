@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import asyncio
 import json
 import errno
 import hashlib
@@ -339,11 +340,34 @@ def create_mcp_server(service: IntelligenceService):
     from fastmcp import FastMCP
 
     server = FastMCP("Open Source Intelligence Tracker")
-    server.tool(service.get_surging_repos, description="List currently SURGING Repositories.")
-    server.tool(service.search_repositories, description="Filter Repositories by language, Lifecycle State, Curation, keyword and star velocity.")
-    server.tool(service.get_curated_highlights, description="List curated Repository highlights.")
-    server.tool(service.get_repo_trajectory, description="Retrieve one Repository and its ordered Snapshot trajectory by GitHub repository ID.")
-    server.tool(service.sync_database_now, description="Immediately check the Release for a fresh database.")
+
+    @server.tool(description="List currently SURGING Repositories.")
+    async def get_surging_repos() -> dict:
+        return await asyncio.to_thread(service.get_surging_repos)
+
+    @server.tool(description="Filter Repositories by language, Lifecycle State, Curation, keyword and star velocity.")
+    async def search_repositories(
+        language: str | None = None, state: str | None = None,
+        curated: bool | None = None, keyword: str | None = None,
+        min_stars_delta_24h: int | None = None, limit: int = 50,
+    ) -> dict:
+        return await asyncio.to_thread(
+            service.search_repositories, language=language, state=state, curated=curated,
+            keyword=keyword, min_stars_delta_24h=min_stars_delta_24h, limit=limit,
+        )
+
+    @server.tool(description="List curated Repository highlights.")
+    async def get_curated_highlights(limit: int = 50) -> dict:
+        return await asyncio.to_thread(service.get_curated_highlights, limit=limit)
+
+    @server.tool(description="Retrieve one Repository and its ordered Snapshot trajectory by GitHub repository ID.")
+    async def get_repo_trajectory(ghr_id: int) -> dict:
+        return await asyncio.to_thread(service.get_repo_trajectory, ghr_id=ghr_id)
+
+    @server.tool(description="Immediately check the Release for a fresh database.")
+    async def sync_database_now() -> dict:
+        return await asyncio.to_thread(service.sync_database_now)
+
     return server
 
 

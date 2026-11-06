@@ -84,3 +84,44 @@ python -m pytest -v --basetemp .pytest_cache\ticket05-review-fix-full-20261105-a
 ```
 
 Use a different exclusive `--basetemp` directory on another run.
+
+## Second-round review repair and verification
+
+The second-round review (`22ade0d...b50c551`) identified three spec defects/boundaries and four testing/design standards items. All behavioral changes and test boundaries were verified with local simulated endpoints and real local bare Git repositories (`git init --bare` with `receive.denyNonFastForwards = true`), with zero outbound calls to real GitHub, Releases, Signal Sources, PyPI, or notification services.
+
+| Second-round finding | Observed red | Observed green |
+| --- | --- | --- |
+| Spec 1: FastMCP 2.14.7 event-loop blocking during forced sync | Registering synchronous `service.*` methods directly on `FastMCP` caused `sync_database_now` to execute on the asyncio event loop thread (`AssertionError: fresh query waited for the forced download`). | `@server.tool` async wrappers delegate to `asyncio.to_thread(...)`; concurrent `get_surging_repos`, `search_repositories`, `get_curated_highlights`, and `get_repo_trajectory` complete over a real `fastmcp.Client` while `sync_database_now` blocks on simulated Release I/O. |
+| Spec 2: Durable write-ahead recovery/stop gate & failure boundaries | Without gated `intelligence-base-revision.txt` ordering and `hashFiles(...)` artifact guard, blocked queued runs still created recovery baseline markers (`AssertionError: assert 'intelligence-base-revision.txt' in 'failure()'`); without a durable remote ref, queued runs could immediately resend digests before human intervention. | `run-intelligence.sh` acquires `refs/heads/intelligence-recovery-pending` via a unique nonce commit and `--force-with-lease=refs/heads/intelligence-recovery-pending:` before writing `intelligence-base-revision.txt` or running ingestion/notifications, and deletes only its own lease (`--force-with-lease=refs/heads/intelligence-recovery-pending:$pending`) after both default-branch push and `gh release upload` succeed. Queued runs stop before ingestion/delivery on SQL conflicts, `gh release upload` failures, or exhausted retries; foreign gate commits are preserved; clearing the gate after reconciliation resumes cleanly without duplicate digests. |
+| Spec 3: Default-branch monotonic ancestry & CAS fast-forward safety | When attempt 1 fetched and rebased onto an intervening commit `R1` and a maintainer rolled `origin/main` back to `$base` before attempt 1's push, checking only `is-ancestor $base FETCH_HEAD` allowed attempt 2 to push `R1` back onto `main` (`status == 0` instead of failing closed). | Tracking `required_ancestor` monotonically across fetch/retry attempts, verifying fast-forward ancestry (`$remote_tip` -> `$candidate`), and pushing with `--force-with-lease=refs/heads/$GITHUB_REF_NAME:$remote_tip` stops safely on rollbacks before fetch, rollbacks before push, rollbacks of previously rebased commits, divergent history rewrites, and concurrent SQL advances during no-SQL-diff runs—while succeeding under `receive.denyNonFastForwards = true`. |
+| Standards 1: Step-level `env` fidelity in workflow tests | Removing `APPRISE_URLS`, `GH_TOKEN`, or `GITHUB_TOKEN` from YAML step `env` was previously masked when the harness injected global environment variables or ignored `GH_TOKEN`. | `WorkflowRun` resolves only workflow/job/step `env` mappings; removing `APPRISE_URLS` triggers `--dry-run` (zero notifications), removing `GH_TOKEN` fails `gh` Release publication while leaving the recovery gate active, and removing `GITHUB_TOKEN` omits `Authorization: Bearer` on GitHub metadata lookups. |
+| Standards 2: Real local bare-repository Git integration tests | The canned `git_stub.py` had no commit graph or real rebase/diff evaluation. | `git_stub.py` was removed entirely; all 25 tests in `tests/test_actions_workflows.py` execute against real local `git init --bare` repositories with real clones, commits, rebases, diffs, ancestry checks, and CAS leases (`GIT_ALLOW_PROTOCOL=file`). |
+| Standards 3: Offline `pip` dependency resolution check | `pip install --no-deps --target ...` exited `0` even when `"missing-offline-dependency>=1.0"` was injected into `pyproject.toml` (`AssertionError: installer ignored an unsatisfied declared dependency`). | Installing with `pip install --no-index --no-build-isolation --prefix ...` (without `--no-deps`) exercises `pip`'s dependency resolver across `apprise>=1.7`, `gtrending>=0.5.1`, `fastmcp>=2.14,<3`, and their transitive graph in the offline SDKs, rejects unsatisfied declared dependencies, passes `python -m pip check`, and exercises both `oss-intelligence --help` and `oss-intelligence-mcp` over stdio. |
+| Standards 4: Workflow YAML guard/recovery evaluation | Evaluated consolidating YAML steps further versus keeping top-level guards explicit. | Added `if: failure() && hashFiles('intelligence-base-revision.txt') != ''` on recovery artifact upload and a defense-in-depth gate-branch refusal in `run-intelligence.sh`, while retaining explicit top-level `Require the default branch`, `Rebase before ingestion`, and `Install project` steps so non-default dispatches fail before Python setup/pull/install, updated source is pulled before `pip install .`, and `permissions: contents: write` + `concurrency: db-pipeline` remain unambiguous without reusable-workflow secret/concurrency scoping hazards. |
+
+### Recovery procedure and residual non-atomic boundaries
+
+When a workflow run fails after acquiring `refs/heads/intelligence-recovery-pending`, subsequent scheduled or manual runs fail closed before ingestion or notification delivery. To recover:
+1. Inspect `git log -1 origin/intelligence-recovery-pending` to identify the failed `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, and baseline commit SHA.
+2. Download the `intelligence-recovery-<run_id>-<run_attempt>` Actions artifact (present whenever the failed run reached gated execution and wrote `intelligence-base-revision.txt`), compare `intelligence.db` and `data/schema_data.sql` against `intelligence-base-revision.txt` and `origin/<default-branch>`, and commit reconciled Repository/Snapshot state and notification watermarks (`last_notified_at`, `last_notified_state`, `last_curated_notified_at`, `surging_entered_at`) onto the default branch.
+3. Upload `intelligence.db` to `latest-db` (`gh release upload latest-db intelligence.db --clobber`) if immediate Release parity is needed, or allow the next scheduled run to refresh `latest-db` once watermarks are committed on the default branch.
+4. Delete the recovery gate ref with `git push origin :refs/heads/intelligence-recovery-pending` (or delete the `intelligence-recovery-pending` branch in the GitHub UI).
+
+Residual non-atomic limitations and offline test boundaries:
+- Gate creation, Apprise delivery, default-branch Git push, `latest-db` Release upload, gate deletion, and Actions artifact upload span separate systems and cannot form a single atomic transaction.
+- Because the gate is acquired before ingestion for write-ahead safety, failures prior to notification delivery (such as configuration errors, crashes, or `--dry-run` push/upload failures) and failures after default-branch push (`gh release upload` failure or gate-deletion failure, including if a maintainer replaced the gate commit) also hold `refs/heads/intelligence-recovery-pending` until manually cleared.
+- If a runner is forcefully terminated/canceled or artifact upload fails after Apprise sends a digest and before SQL push completes, the gate blocks automated re-notification, though unexported local watermarks may be lost if no artifact was uploaded; deleting the gate without reconciling watermarks can permit duplicate notifications.
+- Live PyPI index resolution, PEP 517 isolated build-environment downloads (`--no-build-isolation` is used offline), live GitHub Actions runners, and live GitHub Releases remain unexercised by design.
+
+The complete isolated suite on Windows/Python 3.13 finished with **94 passed, 1 warning** in 313.25 seconds (no skipped tests; the warning is FastMCP 2.14.7's upstream Authlib deprecation):
+
+```powershell
+$sdk05 = (Resolve-Path '.pytest_cache\ticket05-sdk').Path
+$sdk04 = (Resolve-Path '.pytest_cache\ticket04-sdk-30a99fa5bb764194965b42bca54efc13\packages').Path
+$env:PYTHONPATH = "$sdk05;$sdk05\win32;$sdk05\win32\lib;$sdk05\pywin32_system32;$sdk04"
+$env:MCP_TEST_BUILD_PATH = 'C:\Users\t\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\Lib\site-packages'
+Remove-Item Env:GITHUB_TOKEN,Env:GITHUB_REPOSITORY,Env:GITHUB_RELEASE_DB_URL,Env:APPRISE_URLS,Env:TRENDSHIFT_API_KEY -ErrorAction SilentlyContinue
+python -m pytest -v --basetemp .pytest_cache\ticket05-rereview-fix-20261106-full
+```
+
+Use a fresh unique `--basetemp` directory for subsequent runs.

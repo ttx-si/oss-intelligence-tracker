@@ -42,7 +42,7 @@ jobs:
           TRENDSHIFT_API_KEY: ${{ secrets.TRENDSHIFT_API_KEY }}
         run: sh .github/scripts/run-intelligence.sh
       - name: Preserve a failed run for recovery
-        if: failure()
+        if: failure() && hashFiles('intelligence-base-revision.txt') != ''
         uses: actions/upload-artifact@v4
         with:
           name: intelligence-recovery-${{ github.run_id }}-${{ github.run_attempt }}

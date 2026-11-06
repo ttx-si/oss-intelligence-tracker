@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import urllib.error
@@ -315,6 +316,55 @@ def test_real_fastmcp_protocol_exposes_structured_query_tools(tmp_path: Path) ->
     asyncio.run(exercise())
 
 
+def test_real_fastmcp_queries_fresh_cache_while_forced_sync_is_downloading(tmp_path: Path) -> None:
+    fastmcp = pytest.importorskip("fastmcp")
+    from oss_intelligence.mcp_server import create_mcp_server
+
+    content = populated_database(tmp_path / "release.db")
+    entered = threading.Event()
+    resume = threading.Event()
+    download_finished = threading.Event()
+    requests = []
+
+    def endpoint(request, *, timeout):
+        requests.append(request)
+        if len(requests) == 2:
+            entered.set()
+            assert resume.wait(5)
+            download_finished.set()
+        return ReleaseResponse(content)
+
+    service = IntelligenceService(database=tmp_path / "intelligence.db",
+                                  release_url="https://example.invalid/db", opener=endpoint,
+                                  clock=lambda: 10000.0)
+
+    async def exercise():
+        async with fastmcp.Client(create_mcp_server(service)) as client:
+            await client.call_tool("get_surging_repos", {})
+            forced = asyncio.create_task(client.call_tool("sync_database_now", {}))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                surging, searched, curated, trajectory = await asyncio.wait_for(
+                    asyncio.gather(
+                        client.call_tool("get_surging_repos", {}),
+                        client.call_tool("search_repositories", {"language": "Rust"}),
+                        client.call_tool("get_curated_highlights", {}),
+                        client.call_tool("get_repo_trajectory", {"ghr_id": 1}),
+                    ),
+                    2,
+                )
+                assert surging.data["repositories"][0]["full_name"] == "org/rocket"
+                assert searched.data["repositories"][0]["full_name"] == "org/rocket"
+                assert curated.data["repositories"][0]["full_name"] == "org/rocket"
+                assert trajectory.data["repository"]["full_name"] == "org/rocket"
+                assert not download_finished.is_set(), "fresh query waited for the forced download"
+            finally:
+                resume.set()
+                assert (await forced).data["status"] == "updated"
+
+    asyncio.run(exercise())
+
+
 def test_private_rolling_release_resolves_current_asset_through_github_api(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -541,24 +591,59 @@ def test_installed_mcp_command_serves_a_real_stdio_session_offline_from_sql(tmp_
     for filename in ("pyproject.toml", "GLOSSARY.md"):
         shutil.copy(root / filename, project / filename)
     shutil.copytree(root / "src", project / "src", ignore=shutil.ignore_patterns("__pycache__"))
-    installed = tmp_path / "installed"
+    prefix = tmp_path / "installed-prefix"
+    layout = sysconfig.get_paths(vars={"base": str(prefix), "platbase": str(prefix)})
+    site_packages = Path(layout["purelib"])
+    scripts_dir = Path(layout["scripts"])
     env = os.environ.copy()
     env["PIP_CONFIG_FILE"] = os.devnull
     env["PIP_NO_INDEX"] = "1"
+    # Drop src from PYTHONPATH so pip and the installed scripts resolve the built wheel, not the source tree.
+    clean_paths = [
+        entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+        if entry and Path(entry).resolve() != (root / "src").resolve()
+    ]
+    env["PYTHONPATH"] = os.pathsep.join(clean_paths)
     install_env = env.copy()
     if build_path:
-        install_env["PYTHONPATH"] = install_env.get("PYTHONPATH", "") + os.pathsep + build_path
+        install_env["PYTHONPATH"] = install_env["PYTHONPATH"] + os.pathsep + build_path
     install = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation",
-         "--disable-pip-version-check", "--target", str(installed), str(project)],
+        [sys.executable, "-m", "pip", "install", "--no-index", "--no-build-isolation",
+         "--disable-pip-version-check", "--prefix", str(prefix), str(project)],
         env=install_env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
     )
     assert install.returncode == 0, install.stdout + install.stderr
-    command = installed / "bin" / ("oss-intelligence-mcp.exe" if os.name == "nt" else "oss-intelligence-mcp")
-    env["PYTHONPATH"] = str(installed) + os.pathsep + env.get("PYTHONPATH", "")
+    broken = tmp_path / "broken-project"
+    shutil.copytree(project, broken)
+    pyproject = broken / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            '"fastmcp>=2.14,<3"', '"fastmcp>=2.14,<3", "missing-offline-dependency>=1.0"'
+        ),
+        encoding="utf-8",
+    )
+    broken_install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-index", "--no-build-isolation",
+         "--disable-pip-version-check", "--prefix", str(tmp_path / "broken-prefix"), str(broken)],
+        env=install_env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert broken_install.returncode != 0, "installer ignored an unsatisfied declared dependency"
+
+    env["PYTHONPATH"] = str(site_packages) + os.pathsep + env["PYTHONPATH"]
+    pip_check = subprocess.run(
+        [sys.executable, "-m", "pip", "check", "--disable-pip-version-check"],
+        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert pip_check.returncode == 0, pip_check.stdout + pip_check.stderr
+    cli_command = scripts_dir / ("oss-intelligence.exe" if os.name == "nt" else "oss-intelligence")
+    cli_help = subprocess.run([str(cli_command), "--help"], env=env, cwd=tmp_path,
+                              capture_output=True, text=True, timeout=15)
+    assert cli_help.returncode == 0, cli_help.stderr
+    assert "--dry-run" in cli_help.stdout
+    command = scripts_dir / ("oss-intelligence-mcp.exe" if os.name == "nt" else "oss-intelligence-mcp")
     help_result = subprocess.run([str(command), "--help"], env=env, cwd=tmp_path,
                                  capture_output=True, text=True, timeout=15)
-    assert help_result.returncode == 0
+    assert help_result.returncode == 0, help_result.stderr
     assert "--release-url" in help_result.stdout and "--database" in help_result.stdout
 
     source = tmp_path / "release.db"
