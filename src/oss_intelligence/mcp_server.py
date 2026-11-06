@@ -400,7 +400,7 @@ def main(argv: list[str] | None = None) -> None:
     service = IntelligenceService(
         database=args.database, dump_path=args.dump, release_url=args.release_url or _default_release_url(),
     )
-    create_mcp_server(service).run(transport="stdio")
+    create_mcp_server(service).run(transport="stdio", show_banner=False)
 
 
 if __name__ == "__main__":

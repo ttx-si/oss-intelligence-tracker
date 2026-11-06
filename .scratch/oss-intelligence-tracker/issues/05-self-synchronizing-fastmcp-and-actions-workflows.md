@@ -125,3 +125,25 @@ python -m pytest -v --basetemp .pytest_cache\ticket05-rereview-fix-20261106-full
 ```
 
 Use a fresh unique `--basetemp` directory for subsequent runs.
+
+## Third-round review repair and verification
+
+The third-round review (`b50c551...942a1b7`) identified zero spec findings and two testing/script standards items. Both were reproduced first as isolated offline red failures before applying the minimal repairs:
+
+| Third-round finding | Observed red | Observed green |
+| --- | --- | --- |
+| Standards 1: Installed `oss-intelligence-mcp` Git `origin` isolation under repository `--basetemp` | Initializing a parent Git directory above the subprocess workspace with `remote.origin.url = https://github.com/org/demo.git` caused `_default_release_url()` to discover the parent `.git/config` and attempt an outbound HTTPS tunnel (`AssertionError: assert ['CONNECT github.com:443'] == []` on a localhost `127.0.0.1` proxy spy). | Isolating Git discovery (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=os.devnull`, `GIT_CEILING_DIRECTORIES`, `GIT_DIR`, and clearing `GIT_WORK_TREE`/`GIT_CONFIG*`) plus `FASTMCP_HOME` in `test_installed_mcp_command_serves_a_real_stdio_session_offline_from_sql`—and passing `show_banner=False` in `mcp_server.main()` so stdio startup never triggers FastMCP's PyPI version check—completes offline from the SQL dump with zero proxy/network requests (`proxy_requests == []`). |
+| Standards 2: POSIX `sh` pipeline masking `${GITHUB_RUN_ID:?}` / `${GITHUB_RUN_ATTEMPT:?}` in `run-intelligence.sh` | Expanding `${GITHUB_RUN_ID:?}` and `${GITHUB_RUN_ATTEMPT:?}` inside the left-hand `printf` of `printf ... \| git commit-tree ...` under POSIX `/bin/sh` (`set -eu`, no `pipefail`) allowed `git commit-tree` to exit `0` on empty stdin, push a blank-message `refs/heads/intelligence-recovery-pending` commit, and finish with exit status `0` (`AssertionError: empty-run-id unexpectedly succeeded`). | Validating `: "${GITHUB_REF_NAME:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"` up front and building `pending_message` outside any pipeline (`git commit-tree ... -m "$pending_message"`) fails closed across both workflows when `GITHUB_RUN_ID` or `GITHUB_RUN_ATTEMPT` is empty or unset, before `git commit-tree`, `git push`, ingestion, notification, or `gh release` executes (`refs/heads/intelligence-recovery-pending` remains absent). |
+
+The complete isolated suite on Windows/Python 3.13 finished with **96 passed, 1 warning** in 284.99 seconds (no skipped tests; the warning is FastMCP 2.14.7's upstream Authlib deprecation):
+
+```powershell
+$sdk05 = (Resolve-Path '.pytest_cache\ticket05-sdk').Path
+$sdk04 = (Resolve-Path '.pytest_cache\ticket04-sdk-30a99fa5bb764194965b42bca54efc13\packages').Path
+$env:PYTHONPATH = "$sdk05;$sdk05\win32;$sdk05\win32\lib;$sdk05\pywin32_system32;$sdk04"
+$env:MCP_TEST_BUILD_PATH = 'C:\Users\t\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\Lib\site-packages'
+Remove-Item Env:GITHUB_TOKEN,Env:GITHUB_REPOSITORY,Env:GITHUB_RELEASE_DB_URL,Env:APPRISE_URLS,Env:TRENDSHIFT_API_KEY -ErrorAction SilentlyContinue
+python -m pytest -v --basetemp .pytest_cache\ticket05-r3-fix-20261106-final
+```
+
+Use a fresh unique `--basetemp` directory for subsequent runs.

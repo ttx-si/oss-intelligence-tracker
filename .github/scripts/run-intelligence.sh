@@ -2,8 +2,9 @@
 set -eu
 
 # This script starts after the default-branch guard, pull and installation.
+: "${GITHUB_REF_NAME:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
 pending_ref=refs/heads/intelligence-recovery-pending
-if [ "refs/heads/${GITHUB_REF_NAME:?}" = "$pending_ref" ]; then
+if [ "refs/heads/$GITHUB_REF_NAME" = "$pending_ref" ]; then
   echo "Refusing to run the publishing pipeline on the recovery gate ref." >&2
   exit 1
 fi
@@ -13,8 +14,9 @@ git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
 # A unique commit and an absent-ref lease make creation an atomic fail-closed gate.
 nonce=$(python -c 'import secrets; print(secrets.token_hex(16))')
-pending=$(printf 'Intelligence run %s attempt %s\nBaseline: %s\nNonce: %s\n' \
-  "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "$base" "$nonce" | git commit-tree "$base^{tree}" -p "$base")
+pending_message=$(printf 'Intelligence run %s attempt %s\nBaseline: %s\nNonce: %s' \
+  "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "$base" "$nonce")
+pending=$(git commit-tree "$base^{tree}" -p "$base" -m "$pending_message")
 if ! git push --force-with-lease="$pending_ref:" origin "$pending:$pending_ref"; then
   echo "A recovery gate may already exist or could not be created; stop before ingestion." >&2
   exit 1

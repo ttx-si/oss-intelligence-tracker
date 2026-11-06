@@ -618,6 +618,7 @@ def test_failed_sql_publication_gates_queued_runs_until_maintainer_reconciles(
     pending = run.git(run.actor, "ls-remote", "origin", PENDING_REF)
     assert pending
     gate_message = run.git(run.remote, "log", "-1", "--format=%B", PENDING_REF)
+    assert "Intelligence run 1 attempt 1" in gate_message
     assert f"Baseline: {run.baseline}" in gate_message
 
     # A queued scheduled run hits the gate before ingestion/notification and leaves the gate intact.
@@ -711,3 +712,33 @@ def test_exhausted_push_retries_and_foreign_gate_lease_fail_closed(
     assert "Could not clear the recovery gate" in foreign_output
     manual_hold = foreign.git(foreign.actor, "rev-parse", "HEAD").strip()
     assert foreign.git(foreign.remote, "rev-parse", PENDING_REF).strip() == manual_hold
+
+
+@pytest.mark.parametrize("filename", WORKFLOWS)
+def test_missing_or_empty_run_metadata_fails_closed_before_creating_recovery_gate(
+    tmp_path: Path, filename: str
+):
+    cases = (
+        ("empty-run-id", "GITHUB_RUN_ID", ""),
+        ("unset-run-id", "GITHUB_RUN_ID", None),
+        ("empty-attempt", "GITHUB_RUN_ATTEMPT", ""),
+        ("unset-attempt", "GITHUB_RUN_ATTEMPT", None),
+    )
+    for label, variable, value in cases:
+        run = WorkflowRun(tmp_path / label, filename)
+        if value is None:
+            run.env.pop(variable, None)
+        else:
+            run.env[variable] = value
+
+        status, output = run.run()
+
+        assert status != 0, f"{label} unexpectedly succeeded; log:\n{run.command_log()}\noutput:\n{output}"
+        assert variable in output
+        assert "git commit-tree" not in run.command_log()
+        assert "git push" not in run.command_log()
+        assert "gh release" not in run.command_log()
+        assert run.git(run.actor, "ls-remote", "origin", PENDING_REF) == ""
+        assert run.git(run.remote, "rev-parse", "refs/heads/main").strip() == run.baseline
+        assert not run.notifications.exists()
+        assert not (run.directory / "intelligence-base-revision.txt").exists()

@@ -649,11 +649,54 @@ def test_installed_mcp_command_serves_a_real_stdio_session_offline_from_sql(tmp_
     source = tmp_path / "release.db"
     populated_database(source)
     dump = IntelligenceStore(source).export_sql_dump(tmp_path / "schema_data.sql")
-    for key in ("GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_RELEASE_DB_URL"):
+    outer_clone = tmp_path / "outer-clone"
+    workspace = outer_clone / "workspace"
+    workspace.mkdir(parents=True)
+    git_setup_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    subprocess.run(["git", "init"], cwd=outer_clone, env=git_setup_env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "remote.origin.url", "https://github.com/org/demo.git"],
+        cwd=outer_clone, env=git_setup_env, check=True, capture_output=True,
+    )
+    proxy_requests: list[str] = []
+
+    class ProxySpy(BaseHTTPRequestHandler):
+        def _reject(self) -> None:
+            proxy_requests.append(f"{self.command} {self.path}")
+            self.send_response(502)
+            self.end_headers()
+
+        do_CONNECT = _reject
+        do_GET = _reject
+        do_HEAD = _reject
+
+        def log_message(self, *args):
+            pass
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxySpy)
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+    for key in (
+        "GITHUB_TOKEN", "GITHUB_REPOSITORY", "GITHUB_RELEASE_DB_URL",
+        "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+        "NO_PROXY", "no_proxy",
+    ):
         env.pop(key, None)
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CEILING_DIRECTORIES": str(outer_clone),
+        "GIT_DIR": str(workspace / "isolated.git"),
+        "FASTMCP_HOME": str(tmp_path / "fastmcp-home"),
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+    })
     transport = StdioTransport(command=str(command),
-                               args=["--database", str(tmp_path / "intelligence.db"), "--dump", str(dump)],
-                               env=env, cwd=str(tmp_path), keep_alive=False)
+                               args=["--database", str(workspace / "intelligence.db"), "--dump", str(dump)],
+                               env=env, cwd=str(workspace), keep_alive=False)
 
     async def exercise():
         async with fastmcp.Client(transport, timeout=15) as client:
@@ -661,7 +704,13 @@ def test_installed_mcp_command_serves_a_real_stdio_session_offline_from_sql(tmp_
             assert result.data["repositories"][0]["full_name"] == "org/rocket"
             assert "staleness_warning" in result.data["metadata"]
 
-    asyncio.run(exercise())
+    try:
+        asyncio.run(exercise())
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=5)
+    assert proxy_requests == []
 
 
 def test_release_redirect_never_leaks_token_to_another_origin(tmp_path: Path, monkeypatch) -> None:
