@@ -962,3 +962,187 @@ def test_multi_board_attribution_categorization_filtering_and_metadata_breakdown
 
     asyncio.run(exercise_mcp())
 
+
+def test_weighted_domain_categorization_and_expanded_query_limits(
+    tmp_path: Path,
+) -> None:
+    release_db = tmp_path / "release.db"
+    store = IntelligenceStore(release_db)
+
+    benchmark_cases = [
+        (
+            201,
+            "Gathin23/cleanyourtv",
+            "Debloat any Android or Google TV over Wi-Fi and get an Apple TV-style home.",
+            "Python",
+            ("adb", "android-tv", "claude-code", "google-tv", "launcher", "privacy", "smart-tv", "vibe-coding"),
+            None,
+            "Mobile & Desktop Apps",
+        ),
+        (
+            202,
+            "curl/curl",
+            "A command line tool and library for transferring data with URL syntax, supporting HTTP, HTTPS, FTP.",
+            "C",
+            ("c", "client", "curl", "http", "https", "libcurl", "user-agent"),
+            None,
+            "DevTools & Coding",
+        ),
+        (
+            203,
+            "ClickHouse/ClickHouse",
+            "ClickHouse is a real-time analytics database management system",
+            "C++",
+            ("ai", "analytics", "big-data", "clickhouse", "database", "dbms", "olap", "sql"),
+            None,
+            "Data, Storage & Database",
+        ),
+        (
+            204,
+            "pingcap/tidb",
+            "TiDB is built for agentic workloads with ACID guarantees and native support for transactions, analytics, and vector search.",
+            "Go",
+            ("agent", "agentic", "ai", "database", "distributed-database", "htap", "mysql", "sql", "tidb"),
+            None,
+            "Data, Storage & Database",
+        ),
+        (
+            205,
+            "microsoft/vscode",
+            "Visual Studio Code",
+            "TypeScript",
+            ("editor", "electron", "microsoft", "typescript", "visual-studio-code"),
+            None,
+            "DevTools & Coding",
+        ),
+        (
+            206,
+            "l0ng-ai/openidea",
+            "The IDE you know, rebuilt in Rust: editor, code insight, debugger, Git, terminal, database and HTTP clients.",
+            "TypeScript",
+            ("code-editor", "database-client", "debugger", "desktop-app", "git", "ide", "lsp", "tauri", "terminal"),
+            None,
+            "DevTools & Coding",
+        ),
+        (
+            207,
+            "cryptomator/cryptomator",
+            "Cryptomator for Windows, macOS, and Linux: Secure client-side encryption for your cloud storage.",
+            "Java",
+            ("cloud-storage", "crypto", "cryptography", "cryptomator", "encryption", "privacy", "security"),
+            None,
+            "Security & Privacy",
+        ),
+        (
+            208,
+            "agavra/tuicr",
+            "方便在终端里做代码审查的工具。支持 Vim 快捷键的终端代码审查工具。",
+            "Rust",
+            ("ai-tools", "code-review", "rust", "tui"),
+            "Rust 项目",
+            "DevTools & Coding",
+        ),
+        (
+            209,
+            "rails/rails",
+            "Ruby on Rails",
+            "Ruby",
+            ("activejob", "activerecord", "framework", "html", "mvc", "rails", "ruby"),
+            None,
+            "Web & Frontend",
+        ),
+        (
+            210,
+            "tokio-rs/tokio",
+            "A runtime for writing reliable asynchronous applications with Rust. Provides I/O, networking, scheduling.",
+            "Rust",
+            ("asynchronous", "networking", "rust"),
+            None,
+            "Backend, Cloud & Infra",
+        ),
+        (
+            211,
+            "org/mystery-untagged",
+            None,
+            "Rust",
+            (),
+            "其它",
+            "Rust Ecosystem",
+        ),
+    ]
+
+    for ghr_id, full_name, desc, lang, topics, curated_cat, _expected in benchmark_cases:
+        store.save_repository(
+            RepositoryRecord(
+                ghr_id=ghr_id,
+                full_name=full_name,
+                description=desc,
+                primary_language=lang,
+                license_spdx="MIT",
+                topics=topics,
+                repo_created_at="2026-10-25T00:00:00Z",
+                stars_total=5000,
+                forks_total=300,
+                stars_delta_6h=50,
+                stars_delta_24h=250,
+                stars_delta_7d=1000,
+                lifecycle_state="SURGING",
+                is_curated=True,
+                curated_issue="vol-127",
+                curated_category=curated_cat,
+                first_seen_at="2026-11-01T00:00:00Z",
+                last_seen_in_trending_at="2026-11-04T00:00:00Z",
+                last_updated_at="2026-11-04T00:00:00Z",
+            )
+        )
+
+    # Also add 550 additional SURGING & curated repositories to verify >500 query capacity
+    for idx in range(300, 850):
+        store.save_repository(
+            RepositoryRecord(
+                ghr_id=idx,
+                full_name=f"scale/repo-{idx}",
+                description="Fast CLI developer tool",
+                primary_language="Go",
+                license_spdx="MIT",
+                topics=("cli",),
+                repo_created_at="2026-10-25T00:00:00Z",
+                stars_total=1000,
+                forks_total=50,
+                stars_delta_6h=20,
+                stars_delta_24h=180,
+                stars_delta_7d=500,
+                lifecycle_state="SURGING",
+                is_curated=True,
+                curated_issue="vol-127",
+                curated_category="Go 项目",
+                first_seen_at="2026-11-01T00:00:00Z",
+                last_seen_in_trending_at="2026-11-04T00:00:00Z",
+                last_updated_at="2026-11-04T00:00:00Z",
+            )
+        )
+
+    service = IntelligenceService(
+        database=tmp_path / "intelligence.db",
+        release_url="https://example.invalid/intelligence.db",
+        opener=ReleaseEndpoint(release_db.read_bytes()),
+        clock=lambda: 10000.0,
+    )
+
+    all_res = service.search_repositories(limit=1000)
+    total_expected = len(benchmark_cases) + 550
+    assert all_res["metadata"]["total_returned"] == total_expected
+
+    by_name = {r["full_name"]: r for r in all_res["repositories"]}
+    for _ghr_id, full_name, _desc, _lang, _topics, _curated_cat, expected_cat in benchmark_cases:
+        assert by_name[full_name]["category"] == expected_cat, (
+            f"{full_name}: got {by_name[full_name]['category']!r}, expected {expected_cat!r}"
+        )
+
+    # Default limit of 500 for get_surging_repos and get_curated_highlights (and custom limit support)
+    assert service.get_surging_repos()["metadata"]["total_returned"] == 500
+    assert service.get_surging_repos(limit=1000)["metadata"]["total_returned"] == total_expected
+    assert service.get_curated_highlights()["metadata"]["total_returned"] == 500
+    assert service.get_curated_highlights(limit=1000)["metadata"]["total_returned"] == total_expected
+
+

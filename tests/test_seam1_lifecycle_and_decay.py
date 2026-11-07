@@ -886,3 +886,93 @@ def test_cooled_repository_reawakens_to_discovery_or_surging_and_preserves_is_cu
 
 
 
+
+
+def test_subsequent_curation_only_snapshot_does_not_wipe_out_trending_velocity_or_surging_state(
+    tmp_path: Path,
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+    metadata_client = FakeGitHubMetadataClient(
+        {
+            "alejandrobujan/tendedero": _make_metadata(
+                1408099862, "alejandrobujan/tendedero", "Swift", 3063
+            )
+        }
+    )
+
+    # Run 1 (t = 18:38): Repo appears in both gh_search (period_stars_reported=200) and hellogithub (period_stars_reported=0)
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalAdapter(
+                [
+                    RawSignalCandidate(
+                        full_name="alejandrobujan/tendedero",
+                        signal_source="gh_search",
+                        stars=3063,
+                        forks=275,
+                        source_rank=59,
+                        period_stars_reported=200,
+                        primary_language="Swift",
+                    )
+                ],
+                signal_source="gh_search",
+            ),
+            FakeSignalAdapter(
+                [
+                    RawSignalCandidate(
+                        full_name="alejandrobujan/tendedero",
+                        signal_source="hellogithub",
+                        stars=0,
+                        forks=0,
+                        source_rank=30,
+                        period_stars_reported=0,
+                        is_curated=True,
+                        curated_issue="vol-127",
+                        curated_category="Swift 项目",
+                    )
+                ],
+                signal_source="hellogithub",
+            ),
+        ],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    ).run(captured_at="2026-11-06T18:38:52Z")
+
+    after_run1 = store.get_repository_by_ghr_id(1408099862)
+    assert after_run1 is not None
+    assert after_run1.stars_delta_24h == 200
+    assert after_run1.stars_delta_7d == 200
+    assert after_run1.lifecycle_state == "SURGING"
+
+    # Run 2 (t = +6h at 00:33): Repo is re-emitted by hellogithub curation archive with 0 period_stars_reported
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[
+            FakeSignalAdapter(
+                [
+                    RawSignalCandidate(
+                        full_name="alejandrobujan/tendedero",
+                        signal_source="hellogithub",
+                        stars=0,
+                        forks=0,
+                        source_rank=30,
+                        period_stars_reported=0,
+                        is_curated=True,
+                        curated_issue="vol-127",
+                        curated_category="Swift 项目",
+                    )
+                ],
+                signal_source="hellogithub",
+            )
+        ],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    ).run(captured_at="2026-11-07T00:33:27Z")
+
+    after_run2 = store.get_repository_by_ghr_id(1408099862)
+    assert after_run2 is not None
+    assert after_run2.stars_delta_24h == 200
+    assert after_run2.stars_delta_7d == 200
+    assert after_run2.lifecycle_state == "SURGING"
+    assert after_run2.is_curated is True

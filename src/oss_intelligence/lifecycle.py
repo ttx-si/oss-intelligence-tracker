@@ -90,7 +90,10 @@ def _compute_velocities(
     now_dt: datetime,
 ) -> tuple[int, int, int]:
     """Computes (stars_delta_6h, stars_delta_24h, stars_delta_7d) for a Repository at now_dt."""
-    if not observations:
+    trending_observations = [
+        obs for obs in observations if obs.has_trending_source or obs.period_stars_reported > 0
+    ]
+    if not trending_observations:
         last_seen_dt = parse_utc(repo.last_seen_in_trending_at)
         age_sec = (now_dt - last_seen_dt).total_seconds()
         delta_6h = repo.stars_delta_6h if age_sec <= 6 * _SECONDS_PER_HOUR else 0
@@ -98,19 +101,9 @@ def _compute_velocities(
         delta_7d = repo.stars_delta_7d if age_sec <= 7 * _SECONDS_PER_DAY else 0
         return delta_6h, delta_24h, delta_7d
 
-    latest = observations[-1]
+    latest = trending_observations[-1]
     age_since_latest_sec = (now_dt - latest.captured_dt).total_seconds()
-    prior = observations[:-1]
-
-    # If the only observation is a curation-only snapshot with 0 reported delta on a pre-existing repo
-    if (
-        len(observations) == 1
-        and not latest.has_trending_source
-        and latest.period_stars_reported == 0
-        and (repo.stars_delta_6h > 0 or repo.stars_delta_24h > 0 or repo.stars_delta_7d > 0)
-        and age_since_latest_sec <= 24 * _SECONDS_PER_HOUR
-    ):
-        return repo.stars_delta_6h, repo.stars_delta_24h, repo.stars_delta_7d
+    prior = trending_observations[:-1]
 
     # 1. stars_delta_6h
     baseline_6h = (

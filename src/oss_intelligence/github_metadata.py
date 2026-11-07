@@ -7,7 +7,7 @@ import os
 import urllib.request
 from typing import Any
 
-from oss_intelligence.models import RepositoryMetadata
+from oss_intelligence.models import RepositoryMetadata, normalize_description
 
 
 class GitHubMetadataClient:
@@ -42,7 +42,7 @@ class GitHubMetadataClient:
         return RepositoryMetadata(
             ghr_id=int(payload["id"]),
             full_name=str(payload["full_name"]),
-            description=payload.get("description"),
+            description=normalize_description(payload.get("description")),
             primary_language=payload.get("language"),
             license_spdx=license_info.get("spdx_id"),
             topics=tuple(str(t) for t in topics_raw),

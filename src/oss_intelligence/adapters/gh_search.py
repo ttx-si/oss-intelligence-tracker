@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from oss_intelligence.models import RawSignalCandidate
+from oss_intelligence.models import RawSignalCandidate, normalize_description
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +182,7 @@ class GitHubSearchSpikeAdapter:
                         forks=forks,
                         source_rank=int(item.get("rank") or idx),
                         period_stars_reported=period_stars,
-                        description=item.get("description"),
+                        description=normalize_description(item.get("description")),
                         primary_language=item.get("language") or item.get("primary_language"),
                     )
                 )

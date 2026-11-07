@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 
-from oss_intelligence.models import RawSignalCandidate
+from oss_intelligence.models import RawSignalCandidate, normalize_description
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ class HelloGitHubAdapter:
                     continue
                 seen_repos.add(full_name.lower())
 
-                desc = (link_match.group("desc") or "").strip() or None
+                desc = normalize_description(link_match.group("desc"))
                 candidates.append(
                     RawSignalCandidate(
                         full_name=full_name,

@@ -16,6 +16,7 @@ from oss_intelligence.models import (
     RepositoryMetadata,
     RepositoryRecord,
     is_trending_signal_source,
+    normalize_description,
 )
 from oss_intelligence.notifications import AppriseProtocol, deliver_batch_digest
 from oss_intelligence.store import IntelligenceStore
@@ -69,14 +70,20 @@ def _merge_candidate_into_repository(
     merged_stars = max(candidate.stars, meta_stars, existing.stars_total)
     merged_forks = max(candidate.forks, meta_forks, existing.forks_total)
 
+    existing_desc = normalize_description(existing.description)
+    cand_desc = normalize_description(candidate.description)
+    meta_desc = normalize_description(metadata.description if metadata is not None else None)
+    if candidate.is_curated and cand_desc:
+        merged_description = cand_desc
+    elif existing.is_curated and existing_desc:
+        merged_description = existing_desc
+    else:
+        merged_description = meta_desc or existing_desc or cand_desc
+
     updated_repo = replace(
         existing,
         full_name=metadata.full_name if metadata is not None else existing.full_name,
-        description=(
-            (metadata.description if metadata is not None else None)
-            or candidate.description
-            or existing.description
-        ),
+        description=merged_description,
         primary_language=(
             (metadata.primary_language if metadata is not None else None)
             or candidate.primary_language
@@ -211,10 +218,17 @@ class IngestionPipeline:
                     resolved_forks = (
                         candidate.forks if candidate.forks > 0 else metadata.forks_total
                     )
+                    cand_desc = normalize_description(candidate.description)
+                    meta_desc = normalize_description(metadata.description)
+                    initial_description = (
+                        (cand_desc or meta_desc)
+                        if candidate.is_curated
+                        else (meta_desc or cand_desc)
+                    )
                     new_repo = RepositoryRecord(
                         ghr_id=metadata.ghr_id,
                         full_name=metadata.full_name,
-                        description=metadata.description or candidate.description,
+                        description=initial_description,
                         primary_language=metadata.primary_language or candidate.primary_language,
                         license_spdx=metadata.license_spdx,
                         topics=metadata.topics,

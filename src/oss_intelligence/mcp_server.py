@@ -22,6 +22,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Callable
 
+from oss_intelligence.models import normalize_description
+
 _locks_guard = threading.Lock()
 _database_locks: dict[str, threading.RLock] = {}
 
@@ -111,97 +113,231 @@ def _exclusive_sync_lock(database: Path):
     return _exclusive_lock(database.with_name(database.name + ".sync.lock"))
 
 
+_IGNORED_COMPOUND_TOPICS: frozenset[str] = frozenset({
+    "claude-code", "vibe-coding", "user-agent", "database-client", "cloud-storage", "ai-tools",
+})
+
+_LOW_WEIGHT_TOKENS: frozenset[str] = frozenset({
+    "ai", "agent", "agents", "agentic", "database", "storage", "sql",
+    "security", "privacy", "tls", "ssl", "crypto",
+    "android", "ios", "electron", "tauri", "macos", "windows", "linux", "desktop",
+    "web", "html", "ui", "browser",
+    "docker", "cloud", "server", "networking", "mqtt", "smtp", "imap", "pop3",
+    "cli", "git", "shell", "testing", "benchmark",
+})
+
 _CATEGORY_RULES: tuple[tuple[str, set[str], tuple[str, ...]], ...] = (
     (
         "AI / Agents & LLM",
         {
-            "ai", "llm", "llms", "agent", "agents", "mcp", "rag", "openai",
-            "anthropic", "claude", "gpt", "deepseek", "transformer", "diffusion",
+            "ai", "llm", "llms", "agent", "agents", "agentic", "mcp", "rag", "openai",
+            "anthropic", "claude", "gpt", "chatgpt", "gemini", "deepseek", "qwen",
+            "llama", "mistral", "transformer", "transformers", "diffusion",
             "vllm", "ollama", "langchain", "llamaindex", "autogen", "embedding",
-            "embeddings", "neural", "pytorch", "tensorflow",
+            "embeddings", "neural", "pytorch", "tensorflow", "huggingface",
+            "lora", "qlora", "finetuning", "multimodal", "ocr", "tts", "asr",
+            "whisper", "comfyui", "copilot", "codex", "dify", "n8n", "prompt",
+            "prompts", "jailbreak", "interpretability", "neuron", "mlops", "tensor",
         },
         (
             "model-context-protocol", "machine-learning", "deep-learning",
-            "artificial intelligence", "language model", "人工智能", "大模型",
-            "机器学习", "深度学习",
+            "artificial intelligence", "language model", "foundation-models",
+            "foundation model", "image-generation", "text-to-image",
+            "controllable-generation", "fine-tuning", "computer-vision",
+            "prompt-engineering", "mechanistic-interpretability", "token usage",
+            "人工智能", "大模型", "机器学习", "深度学习", "智能体", "提示词", "破甲词",
         ),
     ),
     (
         "Data, Storage & Database",
         {
-            "database", "databases", "sql", "olap", "oltp", "postgres",
-            "postgresql", "sqlite", "mysql", "duckdb", "clickhouse", "redis",
-            "storage", "parquet", "arrow", "etl", "nosql",
+            "database", "databases", "dbms", "sql", "olap", "oltp", "htap", "postgres",
+            "postgresql", "sqlite", "mysql", "mariadb", "mongodb", "duckdb",
+            "clickhouse", "redis", "valkey", "tidb", "dbeaver", "supabase",
+            "elasticsearch", "opensearch", "meilisearch", "qdrant", "milvus",
+            "chromadb", "weaviate", "storage", "parquet", "arrow", "etl", "elt",
+            "airflow", "dag", "nosql", "lakehouse", "databricks", "snowflake",
+            "redshift", "pandas", "numpy", "scipy", "polars", "dataframe",
+            "zfs", "openzfs", "btrfs", "filesystem", "s3", "minio", "compression",
+            "lz4", "zstd", "archiver", "archival", "gis", "geospatial", "cartography",
+            "taxonomy", "analytics", "bigdata", "erd", "jdbc",
         },
         (
-            "key-value", "vector-database", "data-engineering", "time-series",
-            "distributed-database", "数据库", "存储",
+            "key-value", "vector-database", "data-engineering", "data-integration",
+            "data-orchestrator", "data-pipelines", "data-science", "data-analysis",
+            "data analysis", "time-series", "distributed-database",
+            "distributed-transactions", "search-engine", "search engine",
+            "file-system", "file system", "object store", "scientific computing",
+            "knowledge-graph", "open-data", "ebook-exporter", "big-data",
+            "数据库", "存储", "数据看板", "消息导出", "全书导出", "导出工具", "知识图谱",
         ),
     ),
     (
         "Security & Privacy",
         {
             "security", "cryptography", "encryption", "decryption", "pentest",
-            "vulnerability", "cybersecurity", "oauth", "tls", "ssl", "firewall",
-            "privacy", "openssl",
+            "pentesting", "vulnerability", "cybersecurity", "cyber", "hacking",
+            "oauth", "oidc", "saml", "keycloak", "iam", "authentication",
+            "authorization", "tls", "ssl", "firewall", "privacy", "openssl",
+            "cryptomator", "vpn", "wireguard", "openvpn", "shadowsocks", "v2ray",
+            "xray", "trojan", "hysteria2", "tuic", "vless", "vmess", "clash",
+            "mihomo", "passkey", "bitwarden", "osint", "forensics", "adblock",
+            "vanguard", "gfw", "ikev2",
         },
-        ("zero-trust", "安全", "加密"),
+        (
+            "zero-trust", "vpn-client", "vpn-server", "sing-box",
+            "identity and access management", "audio-forensics", "stolen-crypto",
+            "filter-bypass", "安全", "加密", "隐私", "防止骚扰",
+        ),
     ),
     (
         "Mobile & Desktop Apps",
         {
             "android", "ios", "flutter", "swiftui", "electron", "tauri",
-            "macos", "multimedia", "mpv",
+            "macos", "windows", "multimedia", "mpv", "ffmpeg", "vlc", "jellyfin",
+            "kodi", "plex", "launcher", "tizen", "webos", "carplay", "ebook",
+            "epub", "kindle", "kobo", "manga", "comics", "kavita", "wallpaper",
+            "wallpapers", "wayland", "hyprland", "sway", "wlroots", "compositor",
+            "waybar", "powertoys", "winui", "winui3", "gtk", "qt", "godot",
+            "godotengine", "gamedev", "game", "games", "gaming", "unreal",
+            "unity", "blender", "slicer", "orcaslicer", "autocad", "cad",
+            "photoshop", "spreadsheet", "wordcraft", "deckcraft", "gridcraft",
+            "cadcraft", "soundcraft", "figcraft", "fooyin", "emulator",
+            "emulators", "switch2", "ps4", "ps2", "recompilation", "recomp",
+            "roblox", "valorant", "minecraft", "arknights", "duanju", "tiktok",
+            "discord", "airdrop",
         },
-        ("react-native", "kotlin-multiplatform", "desktop-app", "mobile-app", "media-player"),
+        (
+            "react-native", "kotlin-multiplatform", "desktop-app", "desktop app",
+            "mobile-app", "media-player", "media-server", "music-player",
+            "music player", "audio-player", "photo viewer", "android-tv",
+            "google-tv", "apple-tv", "smart-tv", "fire-tv", "home-screen",
+            "game-engine", "game engine", "game-development", "game-optimization",
+            "game-port", "pc-port", "static-recompilation", "wayland-compositor",
+            "desktop-customization", "desktop-organizer", "window-switcher",
+            "3d-printing", "虚拟 iphone", "桌面", "播放器", "阅读器", "漫画",
+            "电子书", "墨水屏", "画质增强", "游戏", "短剧",
+        ),
     ),
     (
         "Web & Frontend",
         {
-            "frontend", "react", "vue", "svelte", "nextjs", "angular",
-            "tailwindcss", "css", "pwa", "webgl", "threejs", "dom", "ui",
+            "frontend", "react", "vue", "vue3", "svelte", "nextjs", "nuxt",
+            "remix", "astro", "solid", "solidjs", "angular", "tailwindcss",
+            "tailwind", "css", "css3", "html", "html5", "pwa", "webgl", "webgl2",
+            "threejs", "dom", "ui", "jsx", "vite", "webpack", "django", "rails",
+            "symfony", "laravel", "express", "expressjs", "fastify", "aspnetcore",
+            "hugo", "jekyll", "hexo", "cms", "halo", "d3", "svg", "canvas",
+            "leaflet", "chart", "charts", "echarts", "visualization", "vtuber",
+            "webtoon", "mvc", "activerecord",
         },
-        ("web-framework", "ui-components", "web-performance", "前端"),
+        (
+            "web-framework", "webframework", "web framework", "php-framework",
+            "php framework", "static-site-generator", "content-management-system",
+            "blog-engine", "website-builder", "ui-components", "user interfaces",
+            "web-performance", "data-visualization", "chrome-extension",
+            "newtab-page", "前端", "建站", "浏览器", "新标签页", "书签", "网页版",
+        ),
     ),
     (
         "Backend, Cloud & Infra",
         {
             "kubernetes", "k8s", "docker", "container", "containers", "cncf",
-            "microservices", "serverless", "terraform", "devops", "prometheus",
-            "monitoring", "grpc", "raft", "consensus",
+            "microservices", "serverless", "terraform", "ansible", "devops",
+            "prometheus", "grafana", "datadog", "apm", "opentracing", "monitoring",
+            "observability", "grpc", "raft", "consensus", "tokio", "netty",
+            "libuv", "asynchronous", "networking", "tcp", "udp", "quic", "iperf",
+            "iperf3", "mqtt", "voip", "sip", "asterisk", "openwrt", "router",
+            "routing", "multipath", "systemd", "init", "rtos", "nuttx", "firmware",
+            "uefi", "driver", "embedded", "mcu", "microcontroller", "esp32",
+            "esp8266", "arduino", "ros2", "robotics", "drone", "quadcopter",
+            "uav", "mavlink", "autopilot", "iot", "esphome", "wled", "mailserver",
+            "smtp", "imap", "pop3", "postfix", "dovecot", "azure", "aws", "gcp",
+            "cloud", "aspire", "spring", "blockchain", "ethereum", "optimism",
+            "rollup", "trading", "quantconnect",
         },
-        ("cloud-native", "reverse-proxy", "load-balancer", "distributed-systems"),
+        (
+            "cloud-native", "reverse-proxy", "load-balancer", "distributed-systems",
+            "spring-boot", "spring-framework", "home-automation", "home-assistant",
+            "flight-controller", "service manager", "operating system",
+            "network bandwidth", "mail server", "raspberry-pi",
+            "邮件服务器", "域名邮箱", "软路由", "无人机", "机器人", "树莓派", "模拟器", "固件",
+        ),
     ),
     (
         "DevTools & Coding",
         {
-            "linter", "formatter", "compiler", "ide", "editor", "neovim",
-            "vscode", "cli", "terminal", "tui", "shell", "nushell", "debugger",
-            "git", "testing", "benchmark", "zed", "ruff",
+            "linter", "lint", "lints", "clippy", "formatter", "formatting",
+            "compiler", "compiles", "typechecker", "ide", "intellij", "editor",
+            "neovim", "vim", "emacs", "vscode", "zed", "cli", "terminal", "tui",
+            "shell", "nushell", "powershell", "debugger", "dap", "lsp", "git",
+            "mercurial", "testing", "benchmark", "ruff", "uv", "bazel", "cmake",
+            "maven", "gradle", "cargo", "npm", "pnpm", "yarn", "bun", "deno",
+            "jdk", "openjdk", "jvm", "dotnet", "golang", "typescript", "pydantic",
+            "jackson", "clap", "broot", "curl", "libcurl", "refactoring", "ast",
+            "sdk", "decompilation", "latex", "lualatex", "tikz",
         },
-        ("text-editor", "static-analysis", "package-manager", "visual-studio-code", "build-tool"),
+        (
+            "text-editor", "code-editor", "code-review", "static-analysis",
+            "package-manager", "visual-studio-code", "build-tool", "build-system",
+            "build system", "command-line", "command line", "argument-parser",
+            "argument-parsing", "programming-language", "programming language",
+            "developer-tools", "refactoring-tools", "reverse-engineering",
+            "reverse-enginnering", "low-level-design", "design-patterns",
+            "interview-questions", "http library", "command line tool",
+            "transfer-data", "transferring-data",
+            "压测", "代码审查", "命令行", "终端", "编程工具", "代码跳转", "断点调试", "硬件检测",
+        ),
     ),
 )
 
 
 def _classify_category(row: dict, topics: list[str]) -> str:
-    text_blob = " ".join(
-        str(part)
-        for part in (
-            " ".join(topics),
-            row.get("description") or "",
-            row.get("curated_category") or "",
-        )
-        if part
-    ).lower()
-    words = set(re.findall(r"[a-z0-9]+", text_blob)) | {t.lower() for t in topics}
-    for label, word_tokens, phrases in _CATEGORY_RULES:
-        if words & word_tokens or any(phrase in text_blob for phrase in phrases):
-            return label
+    raw_topics = [str(t).strip().lower() for t in topics if t and str(t).strip()]
+    filtered_topics = [t for t in raw_topics if t not in _IGNORED_COMPOUND_TOPICS]
+    topic_set = set(filtered_topics)
+    topic_words: set[str] = set()
+    for t in filtered_topics:
+        topic_words.update(re.findall(r"[a-z0-9]+", t))
+
+    desc_text = str(row.get("description") or "").lower()
+    desc_clean = desc_text.replace("user-agent", " ").replace("user agent", " ")
+    desc_words = set(re.findall(r"[a-z0-9]+", desc_clean))
+
+    full_name = str(row.get("full_name") or "").lower()
+    repo_slug = full_name.split("/")[-1] if "/" in full_name else full_name
+    name_words = set(re.findall(r"[a-z0-9]+", full_name)) | ({repo_slug} if repo_slug else set())
 
     curated_cat = str(row.get("curated_category") or "").strip()
-    if curated_cat and curated_cat != "Uncategorized":
-        return curated_cat
+    all_words = topic_set | topic_words | desc_words | name_words
+    searchable_text = f"{' '.join(filtered_topics)} {desc_clean} {full_name}"
+
+    best_label: str | None = None
+    best_score = 0
+
+    for label, word_tokens, phrases in _CATEGORY_RULES:
+        score = 0
+        matched_words = all_words & word_tokens
+        for tok in matched_words:
+            if tok in _LOW_WEIGHT_TOKENS:
+                score += 1
+            else:
+                score += 3
+                if tok in name_words or tok in topic_set:
+                    score += 2
+        for phrase in phrases:
+            if phrase in searchable_text:
+                score += 4
+        if label == "AI / Agents & LLM" and curated_cat in {"人工智能", "Skills"}:
+            score += 4
+
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label is not None and best_score > 0:
+        return best_label
+
     lang = str(row.get("primary_language") or "").strip()
     if lang:
         return f"{lang} Ecosystem"
@@ -226,6 +362,7 @@ def _is_new_breakout(repo_created_at: str | None, last_updated_at: str | None) -
 
 def _enrich_repository(row: sqlite3.Row | dict, signal_sources: list[str]) -> dict:
     item = dict(row)
+    item["description"] = normalize_description(item.get("description"))
     try:
         raw_topics = json.loads(item.get("topics_json") or "[]")
         topics = [str(t) for t in raw_topics] if isinstance(raw_topics, list) else []
@@ -368,8 +505,8 @@ class IntelligenceService:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def get_surging_repos(self) -> dict:
-        return self.search_repositories(state="SURGING")
+    def get_surging_repos(self, limit: int = 500) -> dict:
+        return self.search_repositories(state="SURGING", limit=limit)
 
     def search_repositories(
         self, language: str | None = None, state: str | None = None,
@@ -400,7 +537,7 @@ class IntelligenceService:
                 "AND lower(s.signal_source) = lower(?))"
             )
             parameters.append(source.strip())
-        clamped_limit = max(1, min(limit, 500))
+        clamped_limit = max(1, min(limit, 5000))
         sql = (
             "SELECT * FROM repositories WHERE "
             + " AND ".join(conditions)
@@ -460,7 +597,7 @@ class IntelligenceService:
             finally:
                 conn.close()
 
-    def get_curated_highlights(self, limit: int = 50) -> dict:
+    def get_curated_highlights(self, limit: int = 500) -> dict:
         return self.search_repositories(curated=True, limit=limit)
 
     def get_repo_trajectory(self, ghr_id: int) -> dict:
@@ -533,8 +670,8 @@ def create_mcp_server(service: IntelligenceService):
     server = FastMCP("Open Source Intelligence Tracker")
 
     @server.tool(description="List currently SURGING Repositories.")
-    async def get_surging_repos() -> dict:
-        return await asyncio.to_thread(service.get_surging_repos)
+    async def get_surging_repos(limit: int = 500) -> dict:
+        return await asyncio.to_thread(service.get_surging_repos, limit=limit)
 
     @server.tool(description="Filter Repositories by language, Lifecycle State, Curation, Signal Source, domain category, keyword and star velocity.")
     async def search_repositories(
@@ -550,7 +687,7 @@ def create_mcp_server(service: IntelligenceService):
         )
 
     @server.tool(description="List curated Repository highlights.")
-    async def get_curated_highlights(limit: int = 50) -> dict:
+    async def get_curated_highlights(limit: int = 500) -> dict:
         return await asyncio.to_thread(service.get_curated_highlights, limit=limit)
 
     @server.tool(description="Retrieve one Repository and its ordered Snapshot trajectory by GitHub repository ID.")

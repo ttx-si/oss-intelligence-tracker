@@ -892,4 +892,108 @@ def test_pipeline_skips_deleted_or_unresolvable_repository_metadata_with_warning
     assert [r.full_name for r in repos] == ["astral-sh/uv"]
 
 
+def test_description_whitespace_normalization_and_curated_merge_priority(
+    tmp_path: Path,
+) -> None:
+    store = IntelligenceStore(tmp_path / "intelligence.db")
+
+    metadata_client = FakeGitHubMetadataClient(
+        {
+            "org/curated-first": RepositoryMetadata(
+                ghr_id=701,
+                full_name="org/curated-first",
+                description="  Generic   English\n  GitHub description  ",
+                primary_language="Python",
+                license_spdx="MIT",
+                topics=("python",),
+                repo_created_at="2026-10-01T00:00:00Z",
+                stars_total=1200,
+                forks_total=60,
+            ),
+            "rails/rails": RepositoryMetadata(
+                ghr_id=702,
+                full_name="rails/rails",
+                description="Ruby on Rails official repository",
+                primary_language="Ruby",
+                license_spdx="MIT",
+                topics=("rails", "ruby"),
+                repo_created_at="2008-04-11T00:00:00Z",
+                stars_total=56000,
+                forks_total=21000,
+            ),
+        }
+    )
+
+    # Run 1: Ingest org/curated-first via HelloGitHub and rails/rails via Gtrending (with HTML whitespace pollution)
+    hg_run1 = HelloGitHubAdapter(
+        markdown_fetcher=lambda: (
+            "# HelloGitHub 第 127 期\n"
+            "### Python 项目\n"
+            "1、[org/curated-first](https://github.com/org/curated-first)：  精心撰写的   中文精选评语。  \n"
+        )
+    )
+    gt_run1 = GtrendingAdapter(
+        fetcher=lambda: [
+            {
+                "fullname": "rails/rails",
+                "stars": 56000,
+                "forks": 21000,
+                "currentPeriodStars": 50,
+                "description": "\n      Ruby on Rails\n      web framework\n    ",
+                "language": "Ruby",
+            }
+        ]
+    )
+    assert gt_run1.fetch_candidates()[0].description == "Ruby on Rails web framework"
+
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[hg_run1, gt_run1],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    ).run(captured_at="2026-11-06T18:00:00Z")
+
+    curated_first = store.get_repository_by_ghr_id(701)
+    assert curated_first is not None
+    # Curated editorial description must win on first ingestion and be whitespace-normalized
+    assert curated_first.description == "精心撰写的 中文精选评语。"
+
+    rails_r1 = store.get_repository_by_ghr_id(702)
+    assert rails_r1 is not None
+    assert rails_r1.description == "Ruby on Rails official repository"
+
+    # Run 2 (cached, metadata=None): Gtrending emits both repos with noisy scraped descriptions
+    gt_run2 = GtrendingAdapter(
+        fetcher=lambda: [
+            {
+                "fullname": "org/curated-first",
+                "stars": 1250,
+                "forks": 62,
+                "currentPeriodStars": 50,
+                "description": "\n   Noisy scraped HTML description   \n",
+                "language": "Python",
+            },
+            {
+                "fullname": "rails/rails",
+                "stars": 56050,
+                "forks": 21005,
+                "currentPeriodStars": 55,
+                "description": "\n   Truncated scraper description   \n",
+                "language": "Ruby",
+            },
+        ]
+    )
+    IngestionPipeline(
+        store=store,
+        signal_adapters=[gt_run2],
+        metadata_client=metadata_client,
+        sleep_fn=lambda _: None,
+    ).run(captured_at="2026-11-07T00:00:00Z")
+
+    # Neither curated description nor existing clean metadata description may be overwritten by cached scraper run
+    assert store.get_repository_by_ghr_id(701).description == "精心撰写的 中文精选评语。"
+    assert store.get_repository_by_ghr_id(702).description == "Ruby on Rails official repository"
+
+
+
 

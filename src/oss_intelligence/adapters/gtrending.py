@@ -8,7 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
-from oss_intelligence.models import RawSignalCandidate
+from oss_intelligence.models import RawSignalCandidate, normalize_description
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ class GtrendingAdapter:
                 forks = int(item.get("forks") or 0)
                 raw_period = int(item.get("currentPeriodStars") or 0)
                 period_stars = _normalize_period_stars(raw_period, since)
-                description = item.get("description")
+                description = normalize_description(item.get("description"))
                 primary_language = item.get("language")
 
                 if key not in candidates_by_key:

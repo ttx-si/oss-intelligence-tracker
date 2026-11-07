@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from oss_intelligence.models import RepositoryRecord, SnapshotRecord
+from oss_intelligence.models import RepositoryRecord, SnapshotRecord, normalize_description
 
 SCHEMA_DDL = """\
 CREATE TABLE IF NOT EXISTS repositories (
@@ -204,7 +204,7 @@ class IntelligenceStore:
                 (
                     record.ghr_id,
                     record.full_name,
-                    record.description,
+                    normalize_description(record.description),
                     record.primary_language,
                     record.license_spdx,
                     topics_json,
@@ -346,7 +346,7 @@ class IntelligenceStore:
         return RepositoryRecord(
             ghr_id=int(row["ghr_id"]),
             full_name=str(row["full_name"]),
-            description=row["description"],
+            description=normalize_description(row["description"]),
             primary_language=row["primary_language"],
             license_spdx=row["license_spdx"],
             topics=tuple(str(t) for t in topics_list),

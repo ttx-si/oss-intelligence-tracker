@@ -12,6 +12,13 @@ def is_trending_signal_source(signal_source: str) -> bool:
     return signal_source not in CURATION_SIGNAL_SOURCES
 
 
+def normalize_description(value: str | None) -> str | None:
+    """Collapses internal newlines/tabs/whitespace into single spaces and returns None when empty."""
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split()) or None
+
+
 @dataclass(frozen=True, slots=True)
 class RawSignalCandidate:
     """Candidate repository emitted by a Signal Source adapter."""
